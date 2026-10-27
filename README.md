@@ -1,4 +1,4 @@
-# vllm-ernie5-plugin
+# vLLM-ERNIE
 
 vLLM plugin for ERNIE 5.5 (`Ernie5_5_MoeForCausalLM`:
 MLA + HCA + DSA, mHC, MoE), with MTP and DSpark speculative decoding and the
@@ -10,7 +10,8 @@ MLA + HCA + DSA, mHC, MoE), with MTP and DSpark speculative decoding and the
 ```bash
 uv venv --python 3.12 ernie5-venv && source ernie5-venv/bin/activate
 uv pip install vllm==0.32.0
-uv pip install -e /path/to/vllm-ernie5-plugin --no-deps
+git clone https://github.com/baidu/vLLM-ERNIE.git
+uv pip install -e vLLM-ERNIE --no-deps
 ```
 
 The plugin is loaded through the `vllm.general_plugins` entry point in every
