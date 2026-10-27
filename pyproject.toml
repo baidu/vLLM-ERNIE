@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ernie5-plugin"
+version = "0.1.0"
+description = "vLLM plugin for ERNIE 5.5 (Ernie5_5_MoeForCausalLM)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["vllm==0.32.0"]
+
+[project.entry-points."vllm.general_plugins"]
+ernie5 = "vllm_ernie5_plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vllm_ernie5_plugin*"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vllm_ernie5_plugin"]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "vllm",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.isort.sections]
+vllm = ["vllm"]
