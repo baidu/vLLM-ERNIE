@@ -32,7 +32,7 @@ _applied = False
 def _patch_config_registry() -> None:
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
-    from vllm_ernie5_plugin.config import Ernie5_5Config
+    from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
     _CONFIG_REGISTRY.setdefault(ERNIE5_MODEL_TYPE, Ernie5_5Config)
 
@@ -142,11 +142,11 @@ def _register_parsers() -> None:
 
     ReasoningParserManager.register_lazy_module(
         "ernie5",
-        "vllm_ernie5_plugin.reasoning_parser",
+        "vllm_ernie.models.ernie5_5.reasoning_parser",
         "Ernie5ParserReasoningAdapter",
     )
     ToolParserManager.register_lazy_module(
-        "ernie5", "vllm_ernie5_plugin.tool_parser", "Ernie5ToolParser"
+        "ernie5", "vllm_ernie.models.ernie5_5.tool_parser", "Ernie5ToolParser"
     )
 
 

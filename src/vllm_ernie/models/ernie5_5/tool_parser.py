@@ -18,7 +18,7 @@ from xgrammar.structural_tag import (
 from vllm.tool_parsers.structural_tag_registry import register_vllm_structural_tag
 from vllm.tool_parsers.tool_strict_level import ToolStrictLevel
 
-from vllm_ernie5_plugin.parser import (
+from vllm_ernie.models.ernie5_5.parser import (
     TOOL_CALL_END,
     TOOL_CALL_START,
     Ernie5ParserToolAdapter,

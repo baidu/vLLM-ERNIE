@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_mxfp8_scale_is_lossless():
     """32x32 power-of-two block scales dequantize identically as MXFP8."""
-    from vllm_ernie5_plugin.ernie5.nvidia.quant_config import to_mxfp8_weight_scale
+    from vllm_ernie.models.ernie5_5.nvidia.quant_config import to_mxfp8_weight_scale
 
     n, k = 64, 96
     exp = torch.randint(-12, 4, (n // 32, k // 32))
@@ -41,7 +41,7 @@ def test_mxfp8_scale_is_lossless():
 )
 def test_mxfp8_only_for_b32_ue8m0(block, scale_fmt, expected):
     """Only 32x32 ue8m0 checkpoints switch to MXFP8, and only on Blackwell."""
-    from vllm_ernie5_plugin.ernie5.nvidia.quant_config import Ernie5_5MXFP8Config
+    from vllm_ernie.models.ernie5_5.nvidia.quant_config import Ernie5_5MXFP8Config
 
     hf_cfg = {"quant_method": "fp8", "activation_scheme": "dynamic"}
     hf_cfg["weight_block_size"] = block

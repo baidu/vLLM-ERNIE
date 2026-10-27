@@ -15,9 +15,9 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )
 
-import vllm_ernie5_plugin
-from vllm_ernie5_plugin.config import Ernie5_5Config
-from vllm_ernie5_plugin.patches import _undo_dspark_rewrite
+from vllm_ernie.models import ernie5_5
+from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
+from vllm_ernie.models.ernie5_5.patches import _undo_dspark_rewrite
 
 
 def test_ernie5_5_dsa_layers_use_hybrid_mla_dims():
@@ -38,7 +38,7 @@ def test_ernie5_5_dsa_layers_use_hybrid_mla_dims():
 
 def test_architectures_and_config_registered():
     supported = ModelRegistry.get_supported_archs()
-    assert set(vllm_ernie5_plugin.ARCHITECTURES) <= set(supported)
+    assert set(ernie5_5.ARCHITECTURES) <= set(supported)
     assert _CONFIG_REGISTRY["ernie5_5_moe"] is Ernie5_5Config
     breakable = default_breakable_cudagraph_architectures()
     assert {"Ernie5_5_MoeForCausalLM", "Ernie5_5MoeMTPModel"} <= breakable

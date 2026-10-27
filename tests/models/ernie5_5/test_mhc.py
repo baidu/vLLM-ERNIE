@@ -38,7 +38,7 @@ def _mhc_pre_ref(residual, fn, hc_scale, hc_base, rms_eps, pre_eps, sk_eps, alph
 def test_mhc_pre_rms_eps_outside_sqrt(num_tokens, entry):
     """The plugin ops use ``1 / (sqrt(mean) + eps)``; a large eps separates it
     from vLLM's ``rsqrt(mean + eps)``."""
-    from vllm_ernie5_plugin.mhc import (
+    from vllm_ernie.models.ernie5_5.mhc import (
         mhc_fused_post_pre_tilelang,
         mhc_pre_broadcast_tilelang,
         mhc_pre_tilelang,

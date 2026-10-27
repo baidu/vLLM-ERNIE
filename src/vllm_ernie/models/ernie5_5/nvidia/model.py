@@ -47,8 +47,8 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_ernie5_plugin.config import Ernie5_5Config
-from vllm_ernie5_plugin.mhc import (
+from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
+from vllm_ernie.models.ernie5_5.mhc import (
     mhc_fused_post_pre_tilelang,
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
@@ -167,7 +167,9 @@ class Ernie5_5DecoderLayer(nn.Module):
         )
         from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-        from vllm_ernie5_plugin.mhc_kernels import _MHC_PRE_BIG_FUSE_TILELANG_KERNEL
+        from vllm_ernie.models.ernie5_5.mhc_kernels import (
+            _MHC_PRE_BIG_FUSE_TILELANG_KERNEL,
+        )
 
         include_pre_gemm_splits = is_deep_gemm_supported()
         _MHC_PRE_BIG_FUSE_TILELANG_KERNEL.register_warmup(

@@ -1,9 +1,10 @@
 # vLLM-ERNIE
 
-vLLM plugin for ERNIE 5.5 (`Ernie5_5_MoeForCausalLM`:
+vLLM plugin for ERNIE models, one package per model under
+`src/vllm_ernie/models/`. It currently serves ERNIE 5.5 (`Ernie5_5_MoeForCausalLM`:
 MLA + HCA + DSA, mHC, MoE), with MTP and DSpark speculative decoding and the
 `ernie5` reasoning / tool-call parsers. It runs on the released vLLM
-**0.32.0** wheel, unmodified. Validated on 4x GB200 (aarch64, sm100).
+**0.32.0** wheel, unmodified.
 
 ## Install
 
@@ -20,7 +21,7 @@ resolve).
 
 ## Serve
 
-One node (4x GB200): attention DP4 (VHA needs attention TP=1) + EP4.
+One node with 4 GPUs: attention DP4 (VHA needs attention TP=1) + EP4.
 
 ### FP8 + MTP
 
@@ -80,7 +81,7 @@ vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
 
 A 1M-token prefill needs extra temporary memory, so lower
 `--gpu-memory-utilization` from the default 0.92 to 0.85. The values are for
-GB200 (184 GiB).
+GPUs with 184 GiB of memory.
 
 FP8 + MTP:
 

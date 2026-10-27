@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
-from vllm_ernie5_plugin.config import Ernie5_5Config
+from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
 
 class Ernie5_5MLP(nn.Module):

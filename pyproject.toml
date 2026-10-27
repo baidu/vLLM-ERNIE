@@ -3,19 +3,19 @@ requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm-ernie5-plugin"
+name = "vllm-ernie"
 version = "0.1.0"
-description = "vLLM plugin for ERNIE 5.5 (Ernie5_5_MoeForCausalLM)"
+description = "vLLM plugin for ERNIE models"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = ["vllm==0.32.0"]
 
 [project.entry-points."vllm.general_plugins"]
-ernie5 = "vllm_ernie5_plugin:register"
+ernie = "vllm_ernie:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["vllm_ernie5_plugin*"]
+include = ["vllm_ernie*"]
 
 [tool.ruff]
 line-length = 88
@@ -24,7 +24,7 @@ line-length = 88
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["vllm_ernie5_plugin"]
+known-first-party = ["vllm_ernie"]
 section-order = [
     "future",
     "standard-library",

@@ -30,7 +30,7 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
 
-from vllm_ernie5_plugin.parser import (
+from vllm_ernie.models.ernie5_5.parser import (
     THINK_END,
     THINK_START,
     TOOL_CALL_END,
@@ -38,7 +38,7 @@ from vllm_ernie5_plugin.parser import (
     Ernie5Parser,
     Ernie5ParserReasoningAdapter,
 )
-from vllm_ernie5_plugin.tool_parser import Ernie5ToolParser
+from vllm_ernie.models.ernie5_5.tool_parser import Ernie5ToolParser
 
 _IM_START_ID = 7
 _IM_END_ID = 8

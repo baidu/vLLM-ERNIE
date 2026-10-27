@@ -6,11 +6,11 @@ import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 
-import vllm_ernie5_plugin
+import vllm_ernie
 
 # Engine processes get this through the ``vllm.general_plugins`` entry point;
 # unit tests import plugin modules directly, so register up front.
-vllm_ernie5_plugin.register()
+vllm_ernie.register()
 
 
 @pytest.fixture

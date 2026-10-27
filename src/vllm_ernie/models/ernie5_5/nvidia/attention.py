@@ -67,7 +67,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
-from vllm_ernie5_plugin.config import Ernie5_5Config
+from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
 VHA_RANK = 16
 # FlashMLA sparse and the paged MQA logits kernels both use 64-token pages.
@@ -208,13 +208,13 @@ class Ernie5_5HCAAttentionMixin:
 class Ernie5_5HCAFlashInferAttention(
     Ernie5_5HCAAttentionMixin, DeepseekV4FlashInferMLAAttention
 ):
-    pass
+    """HCA layer on FlashInfer TRTLLM-gen sparse MLA (bf16 KV cache)."""
 
 
 class Ernie5_5HCAFlashMLAAttention(
     Ernie5_5HCAAttentionMixin, DeepseekV4FlashMLAAttention
 ):
-    pass
+    """HCA layer on FlashMLA sparse MLA (``fp8_ds_mla`` KV cache)."""
 
 
 def select_ernie5_5_hca_cls(kv_cache_dtype: str) -> type[DeepseekV4Attention]:

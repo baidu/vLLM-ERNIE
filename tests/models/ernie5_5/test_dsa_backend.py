@@ -17,7 +17,7 @@ WINDOW, TOPK = 128, 2048
 
 def test_merge_swa_topk_appends_window():
     """The indexer writes contiguous top-k rows; attention reads wider rows."""
-    from vllm_ernie5_plugin.ernie5.nvidia.attention import merge_swa_topk
+    from vllm_ernie.models.ernie5_5.nvidia.attention import merge_swa_topk
 
     positions = torch.tensor([0, 5, 127, 128, 200, 2175, 2176, 5000], device="cuda")
     num_tokens, width = positions.shape[0], TOPK + WINDOW
@@ -39,7 +39,9 @@ def test_merge_swa_topk_appends_window():
 
 def test_packed_block_stride_alignment_fits_every_layer_row():
     """HCA, DSA and indexer pages share one stride in the hybrid KV group."""
-    from vllm_ernie5_plugin.ernie5.nvidia.attention import packed_block_stride_alignment
+    from vllm_ernie.models.ernie5_5.nvidia.attention import (
+        packed_block_stride_alignment,
+    )
 
     hf_config = SimpleNamespace(
         head_dim=512, mla_kv_lora_rank=512, mla_qk_rope_head_dim=64
@@ -58,7 +60,7 @@ def test_dsa_kernel_block_sizes_accept_kv_cache_spec(spec):
     """vLLM passes the layer's KV spec when picking kernel block sizes."""
     from vllm.v1.attention.backend import MultipleOf
 
-    from vllm_ernie5_plugin.ernie5.nvidia.attention import (
+    from vllm_ernie.models.ernie5_5.nvidia.attention import (
         Ernie5_5FlashMLASparseBackend,
         Ernie5_5IndexerBackend,
     )
@@ -71,7 +73,7 @@ def test_dsa_kernel_block_sizes_accept_kv_cache_spec(spec):
 @pytest.mark.parametrize("num_rows", [1, 2, 5, 6, 7, 64, 129, 1026])
 def test_hadamard_rows_matches_dense(num_rows):
     """Row counts whose numel is not a multiple of 512 included."""
-    from vllm_ernie5_plugin.ernie5.nvidia.attention import hadamard_rows
+    from vllm_ernie.models.ernie5_5.nvidia.attention import hadamard_rows
 
     dim = 128
     h = torch.ones(1, 1)
@@ -93,7 +95,7 @@ def test_compressor_skip_not_baked_into_cuda_graph(monkeypatch):
 
     from vllm.models.deepseek_v4.compressor import CompressorMetadata
 
-    from vllm_ernie5_plugin.ernie5.nvidia import attention
+    from vllm_ernie.models.ernie5_5.nvidia import attention
 
     seen = []
     monkeypatch.setattr(
