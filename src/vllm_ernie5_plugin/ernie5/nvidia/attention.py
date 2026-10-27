@@ -15,6 +15,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
 )
@@ -73,6 +75,15 @@ DSA_BLOCK_SIZE = 64
 INDEXER_QUANT_BLOCK = 128
 
 
+def hadamard_rows(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard transform per row, zero-padded around a hadacore tail overrun."""
+    num_rows = x.shape[0]
+    pad = -num_rows % max(1, 512 // x.shape[1])
+    if pad:
+        x = nn.functional.pad(x, (0, 0, 0, pad))
+    return ops.hadacore_transform(x, inplace=False)[:num_rows]
+
+
 def _check_attn_tp() -> None:
     if get_tensor_model_parallel_world_size() != 1:
         raise NotImplementedError("ERNIE 5.5 VHA mixes heads; use attention TP=1.")
@@ -104,6 +115,19 @@ def fold_vha(model: nn.Module) -> None:
             module.fold()
 
 
+class Ernie5_5Compressor(DeepseekCompressor):
+    """Keeps C128 compression in piecewise CUDA graphs (upstream #59709)."""
+
+    def forward(self, *args, **kwargs):
+        metadata = get_forward_context().attn_metadata
+        if torch.cuda.is_current_stream_capturing() and isinstance(metadata, dict):
+            name = self.state_cache.prefix
+            state = metadata.get(name)
+            if state is not None and state.c128_boundary is False:
+                metadata[name] = dataclasses.replace(state, c128_boundary=None)
+        return super().forward(*args, **kwargs)
+
+
 class Ernie5_5HCAAttentionMixin:
     """Adds the ERNIE 5 gate and VHA to a DeepSeek V4 attention class."""
 
@@ -131,6 +155,8 @@ class Ernie5_5HCAAttentionMixin:
             prefix=f"{prefix}.o_gate",
         )
         self.vha = VHAPostMix(self.n_heads)
+        if getattr(self, "compressor", None) is not None:
+            self.compressor.__class__ = Ernie5_5Compressor
 
     def forward(
         self,
@@ -545,8 +571,8 @@ class Ernie5_5Indexer(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         q = torch.cat([q_pe.reshape(-1, self.n_head, self.rope_dim), q_nope], -1)
         k = torch.cat([k_pe.reshape(-1, self.rope_dim), k_nope], dim=-1)
-        q = ops.hadacore_transform(q.view(-1, self.head_dim), inplace=False)
-        k = ops.hadacore_transform(k, inplace=False)
+        q = hadamard_rows(q.view(-1, self.head_dim))
+        k = hadamard_rows(k)
 
         q_fp8, q_scale = per_token_group_quant_fp8(
             q, INDEXER_QUANT_BLOCK, column_major_scales=False, use_ue8m0=True

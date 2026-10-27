@@ -66,3 +66,62 @@ def test_dsa_kernel_block_sizes_accept_kv_cache_spec(spec):
     for backend in (Ernie5_5FlashMLASparseBackend, Ernie5_5IndexerBackend):
         assert backend.get_supported_kernel_block_sizes() == [MultipleOf(64)]
         assert backend.get_supported_kernel_block_sizes(spec) == [MultipleOf(64)]
+
+
+@pytest.mark.parametrize("num_rows", [1, 2, 5, 6, 7, 64, 129, 1026])
+def test_hadamard_rows_matches_dense(num_rows):
+    """Row counts whose numel is not a multiple of 512 included."""
+    from vllm_ernie5_plugin.ernie5.nvidia.attention import hadamard_rows
+
+    dim = 128
+    h = torch.ones(1, 1)
+    while h.shape[0] < dim:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    h = (h / dim**0.5).cuda()
+    x = torch.randn(num_rows, dim, device="cuda", dtype=torch.bfloat16)
+
+    out = hadamard_rows(x)
+
+    assert out.shape == x.shape
+    ref = x.float() @ h
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
+
+
+def test_compressor_skip_not_baked_into_cuda_graph(monkeypatch):
+    """Captured graphs must keep the C128 compression the capture batch skips."""
+    import dataclasses
+
+    from vllm.models.deepseek_v4.compressor import CompressorMetadata
+
+    from vllm_ernie5_plugin.ernie5.nvidia import attention
+
+    seen = []
+    monkeypatch.setattr(
+        attention.DeepseekCompressor,
+        "forward",
+        lambda self, *a, **kw: seen.append(metadata[name].c128_boundary),
+    )
+    name = "model.layers.0.attn.compressor.state_cache"
+    state = CompressorMetadata(
+        block_table=torch.zeros(1),
+        slot_mapping=torch.zeros(1),
+        block_size=8,
+        c128_boundary=False,
+    )
+    metadata = {name: state}
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    comp = attention.Ernie5_5Compressor.__new__(attention.Ernie5_5Compressor)
+    object.__setattr__(comp, "state_cache", SimpleNamespace(prefix=name))
+
+    for capturing in (False, True):
+        metadata[name] = dataclasses.replace(state)
+        monkeypatch.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda c=capturing: c
+        )
+        comp.forward()
+
+    assert seen == [False, None]
