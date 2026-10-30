@@ -13,9 +13,17 @@ Each hook mirrors one in-tree change on ``eblite-v1``:
   config is rewritten to ``Ernie5_5MoeMTPModel`` for MTP, and the ERNIE DSpark
   draft keeps its own config instead of the DeepSeek V4 DSpark rewrite
 - ``ernie5`` reasoning and tool-call parsers
+- ``MooncakeConnector`` sends the KV of a prefill whose one token is a stop
+  token (upstream vllm#63998)
 """
 
+import functools
+import inspect
 from typing import Literal, get_args
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 ERNIE5_MODEL_TYPE = "ernie5_5_moe"
 ERNIE5_MTP_MODEL_TYPE = "ernie5_5_moe_mtp"
@@ -150,6 +158,83 @@ def _register_parsers() -> None:
     )
 
 
+_MOONCAKE = "MooncakeConnector"
+
+
+def _patch_mooncake_scheduler(scheduler_cls) -> None:
+    """Make the producer send the KV of a ``FINISHED_STOPPED`` prefill.
+
+    The proxy sends the prefill with ``max_tokens=1``; when that token is EOS
+    or a stop token the request ends ``FINISHED_STOPPED``, which vLLM 0.32.0
+    treats as not processed: P frees the KV while D still pulls it, holding a
+    P sender task until ``VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT``. The decoder
+    recomputes the last prompt token, so sending the KV is always right.
+    """
+    from vllm.v1.request import RequestStatus
+
+    orig = scheduler_cls.request_finished
+    if getattr(orig, "_ernie5_stopped_prefill", False):
+        return
+    # Harmless once upstream accepts FINISHED_STOPPED too (same result), so it
+    # is always applied; only hint that it can be dropped.
+    try:
+        fixed = "!= RequestStatus.FINISHED_LENGTH_CAPPED" not in inspect.getsource(orig)
+    except (OSError, TypeError):
+        fixed = False
+    if fixed:
+        logger.info_once(
+            "MooncakeConnector seems to send stopped prefills already; the "
+            "ERNIE workaround in vllm_ernie patches.py can be removed."
+        )
+
+    @functools.wraps(orig)
+    def request_finished(self, request, block_ids):
+        params = request.kv_transfer_params
+        if (
+            request.status != RequestStatus.FINISHED_STOPPED
+            or not params
+            or not params.get("do_remote_decode")
+            or self.vllm_config.model_config.hf_config.model_type != ERNIE5_MODEL_TYPE
+        ):
+            return orig(self, request, block_ids)
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        try:
+            return orig(self, request, block_ids)
+        finally:
+            request.status = RequestStatus.FINISHED_STOPPED
+
+    request_finished._ernie5_stopped_prefill = True  # type: ignore[attr-defined]
+    scheduler_cls.request_finished = request_finished
+
+
+def _patch_mooncake_connector() -> None:
+    # Wrap the lazy loader so the connector module is only imported when a
+    # server actually uses Mooncake.
+    from vllm.distributed.kv_transfer.kv_connector.factory import (
+        KVConnectorFactory,
+    )
+
+    loader = KVConnectorFactory._registry.get(_MOONCAKE)
+    if loader is None or getattr(loader, "_ernie5_patched", False):
+        return
+
+    def patched_loader():
+        connector_cls = loader()
+        module = inspect.getmodule(connector_cls)
+        scheduler_cls = getattr(module, "MooncakeConnectorScheduler", None)
+        if scheduler_cls is None:
+            logger.warning_once(
+                "MooncakeConnectorScheduler not found; the ERNIE stopped "
+                "prefill workaround is not applied."
+            )
+        else:
+            _patch_mooncake_scheduler(scheduler_cls)
+        return connector_cls
+
+    patched_loader._ernie5_patched = True  # type: ignore[attr-defined]
+    KVConnectorFactory._registry[_MOONCAKE] = patched_loader
+
+
 def apply_patches() -> None:
     global _applied
     if _applied:
@@ -160,3 +245,4 @@ def apply_patches() -> None:
     _patch_arch_config_convertors()
     _patch_speculative_config()
     _register_parsers()
+    _patch_mooncake_connector()

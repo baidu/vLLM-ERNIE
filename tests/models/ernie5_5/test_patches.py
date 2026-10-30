@@ -6,6 +6,8 @@ import pickle
 from types import SimpleNamespace
 from typing import get_args
 
+import pytest
+
 import vllm.config.speculative as spec_mod
 from vllm.config import SpeculativeConfig
 from vllm.config.vllm import default_breakable_cudagraph_architectures
@@ -86,3 +88,59 @@ def test_dspark_draft_keeps_own_config():
     assert draft.hf_config.architectures == ["Ernie5_5_MoeDSparkDraftModel"]
     assert draft.quantization is None
     assert verified
+
+
+class _FakeRequest:
+    def __init__(self, status, params):
+        self.request_id = "r"
+        self.status = status
+        self.kv_transfer_params = params
+
+
+def _mooncake_scheduler(model_type: str):
+    from vllm.distributed.kv_transfer.kv_connector.factory import (
+        KVConnectorFactory,
+    )
+
+    connector_cls = KVConnectorFactory.get_connector_class_by_name("MooncakeConnector")
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+        mooncake_connector,
+    )
+
+    assert connector_cls is mooncake_connector.MooncakeConnector
+    scheduler_cls = mooncake_connector.MooncakeConnectorScheduler
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+    )
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler.get_sw_clipped_blocks = lambda block_ids: block_ids
+    return scheduler
+
+
+@pytest.mark.parametrize(
+    ("model_type", "status_name", "sends"),
+    [
+        ("ernie5_5_moe", "FINISHED_LENGTH_CAPPED", True),
+        # The single prefill token was EOS / a stop token.
+        ("ernie5_5_moe", "FINISHED_STOPPED", True),
+        ("ernie5_5_moe", "FINISHED_ABORTED", False),
+        # Other models keep vLLM's behavior.
+        ("deepseek_v4", "FINISHED_STOPPED", False),
+    ],
+)
+def test_mooncake_sends_stopped_prefill(model_type, status_name, sends):
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _mooncake_scheduler(model_type)
+    status = RequestStatus[status_name]
+    request = _FakeRequest(status, {"do_remote_decode": True, "transfer_id": "t"})
+
+    delay_free, _ = scheduler.request_finished(request, ([3, 4],))
+
+    assert delay_free is sends
+    assert ("r" in scheduler._reqs_need_send) is sends
+    assert ("t" in scheduler._reqs_not_processed) is not sends
+    assert request.status is status
