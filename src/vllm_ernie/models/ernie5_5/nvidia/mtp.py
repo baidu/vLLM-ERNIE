@@ -37,7 +37,7 @@ from .model import (
     load_ernie5_5_weights,
     topk_buffers,
 )
-from .quant_config import use_ernie5_5_mxfp8
+from .quant_config import fp8_block_size, use_ernie5_5_mxfp8
 
 # Per-MTP-layer modules outside the decoder block.
 _MTP_LAYER_OWN = ("enorm.", "hnorm.", "e_proj.", "h_proj.", "shared_head.", "hc_head_")
@@ -62,6 +62,8 @@ class Ernie5_5MTPLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * self.hidden_size
 
+        # Every checkpoint keeps e_proj / h_proj in bf16, with or without an
+        # ignore list for them.
         self.enorm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.hnorm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.e_proj = ReplicatedLinear(
@@ -69,7 +71,7 @@ class Ernie5_5MTPLayer(nn.Module):
             self.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.e_proj",
         )
         self.h_proj = ReplicatedLinear(
@@ -77,7 +79,7 @@ class Ernie5_5MTPLayer(nn.Module):
             self.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.h_proj",
         )
         self.hc_head_fn = fp32_param(self.hc_mult, self.hc_dim)
@@ -205,6 +207,7 @@ class Ernie5_5MTP(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.mxfp8 = use_ernie5_5_mxfp8(vllm_config)
+        self.fp8_block = fp8_block_size(vllm_config)
         self.model = Ernie5_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )

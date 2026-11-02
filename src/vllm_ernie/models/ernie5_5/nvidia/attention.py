@@ -73,6 +73,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
+from .quant_config import keeps_fp8_wo_a
+
 logger = init_logger(__name__)
 
 VHA_RANK = 16
@@ -140,18 +142,20 @@ class Ernie5_5HCAAttentionMixin:
     def __init__(self, vllm_config: VllmConfig, prefix: str, **kwargs) -> None:
         super().__init__(vllm_config, prefix, **kwargs)  # type: ignore[call-arg]
         _check_attn_tp()
-        # wo_a stays bf16 even in FP8 checkpoints. Its checkpoint name has no
-        # `.weight` leaf, so an ignore list could not reach it.
-        self.wo_a = ColumnParallelLinear(
-            self.wo_a.input_size,
-            self.wo_a.output_size,
-            bias=False,
-            quant_config=None,
-            return_bias=False,
-            prefix=f"{prefix}.wo_a",
-        )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.n_local_groups
+        # 128x128 block-FP8 checkpoints quantize wo_a, which the DeepSeek V4
+        # base class already builds for deep_gemm_fp8_o_proj. Otherwise wo_a
+        # runs in bf16 (an FP8 copy is dequantized at load).
+        if not keeps_fp8_wo_a(vllm_config.quant_config):
+            self.wo_a = ColumnParallelLinear(
+                self.wo_a.input_size,
+                self.wo_a.output_size,
+                bias=False,
+                quant_config=None,
+                return_bias=False,
+                prefix=f"{prefix}.wo_a",
+            )
+            self.wo_a.is_bmm = True
+            self.wo_a.bmm_batch_size = self.n_local_groups
         self.o_gate = ReplicatedLinear(
             self.q_lora_rank,
             self.n_groups * self.o_lora_rank,

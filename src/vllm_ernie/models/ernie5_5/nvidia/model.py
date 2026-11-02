@@ -50,7 +50,12 @@ from vllm_ernie.models.ernie5_5.mhc import (
 
 from .attention import Ernie5_5DSAAttention, fold_vha, select_ernie5_5_hca_cls
 from .moe import Ernie5_5MLP, Ernie5_5MoE
-from .quant_config import to_mxfp8_weight_scale, use_ernie5_5_mxfp8
+from .quant_config import (
+    dequantize_block_fp8,
+    fp8_block_size,
+    to_mxfp8_weight_scale,
+    use_ernie5_5_mxfp8,
+)
 
 
 def fp32_param(*shape: int) -> nn.Parameter:
@@ -269,6 +274,7 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         self.config = config
         self.mxfp8 = use_ernie5_5_mxfp8(vllm_config)
+        self.fp8_block = fp8_block_size(vllm_config)
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
@@ -462,12 +468,19 @@ def load_ernie5_5_weights(
 
     Stacked shards arrive with the `shard_id` attribute set by `ernie5_5_mapper`.
     With `model.mxfp8`, block-FP8 ``weight_scale_inv`` is loaded as MXFP8
-    ``weight_scale``.
+    ``weight_scale``. A block-FP8 weight whose layer is built in bf16 (indexer
+    ``wk``, or ``wo_a`` outside the block-FP8 path) is dequantized once its
+    scale has arrived.
     """
     params_dict = dict(model.named_parameters())
     loaded_params: set[str] = set()
     mxfp8 = getattr(model, "mxfp8", False)
-    for name, loaded_weight in weights:
+    # (weight name, shard_id) -> [fp8 weight, scale_inv] seen so far
+    pending: dict[tuple[str, int | None], list[torch.Tensor | None]] = {}
+    block = getattr(model, "fp8_block", [128, 128])
+    for name, loaded_weight in _dequantize_bf16_layers(
+        weights, params_dict, pending, block
+    ):
         if is_pp_missing_parameter(name, model):
             continue
         shard_id = getattr(loaded_weight, "shard_id", None)
@@ -517,7 +530,47 @@ def load_ernie5_5_weights(
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
         loaded_params.add(name)
+    if pending:
+        raise ValueError(f"FP8 weights without scales: {sorted(pending)[:4]}")
     return loaded_params
+
+
+def _dequantize_bf16_layers(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    params_dict: dict[str, nn.Parameter],
+    pending: dict[tuple[str, int | None], list[torch.Tensor | None]],
+    block: list[int],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Pair block-FP8 weights of bf16-built layers with their scales."""
+
+    def bf16_param(weight_name: str) -> bool:
+        head, _, leaf = weight_name.rpartition(".")
+        param = params_dict.get(
+            weight_name, params_dict.get(f"{head}.base_layer.{leaf}")
+        )
+        return param is not None and param.dtype != torch.float8_e4m3fn
+
+    for name, loaded_weight in weights:
+        if name.endswith(".weight_scale_inv"):
+            weight_name, slot = name.removesuffix("_scale_inv"), 1
+        elif loaded_weight.dtype == torch.float8_e4m3fn:
+            weight_name, slot = name, 0
+        else:
+            yield name, loaded_weight
+            continue
+        if not bf16_param(weight_name):
+            yield name, loaded_weight
+            continue
+        shard_id = getattr(loaded_weight, "shard_id", None)
+        pair = pending.setdefault((weight_name, shard_id), [None, None])
+        pair[slot] = loaded_weight
+        if pair[0] is None or pair[1] is None:
+            continue
+        del pending[(weight_name, shard_id)]
+        weight = dequantize_block_fp8(pair[0], pair[1], block)
+        if shard_id is not None:
+            weight.shard_id = shard_id  # type: ignore[attr-defined]
+        yield weight_name, weight
 
 
 def _hc_rules(ckpt: str, kind: str) -> dict[str, tuple[str, int]]:
@@ -573,7 +626,10 @@ ernie5_5_mapper = WeightsMapper(
         "model.mhc_contract.": "model.",
         "model.lm_head.": "lm_head.",
     },
-    orig_to_new_suffix={".attn.wo_a": ".attn.wo_a.weight"},
+    orig_to_new_suffix={
+        ".attn.wo_a": ".attn.wo_a.weight",
+        ".attn.wo_a_scale_inv": ".attn.wo_a.weight_scale_inv",
+    },
 )
 
 
