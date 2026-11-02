@@ -468,14 +468,11 @@ def load_ernie5_5_weights(
 
     Stacked shards arrive with the `shard_id` attribute set by `ernie5_5_mapper`.
     With `model.mxfp8`, block-FP8 ``weight_scale_inv`` is loaded as MXFP8
-    ``weight_scale``. A block-FP8 weight whose layer is built in bf16 (indexer
-    ``wk``, or ``wo_a`` outside the block-FP8 path) is dequantized once its
-    scale has arrived.
+    ``weight_scale``. FP8 weights of bf16 layers are dequantized.
     """
     params_dict = dict(model.named_parameters())
     loaded_params: set[str] = set()
     mxfp8 = getattr(model, "mxfp8", False)
-    # (weight name, shard_id) -> [fp8 weight, scale_inv] seen so far
     pending: dict[tuple[str, int | None], list[torch.Tensor | None]] = {}
     block = getattr(model, "fp8_block", [128, 128])
     for name, loaded_weight in _dequantize_bf16_layers(

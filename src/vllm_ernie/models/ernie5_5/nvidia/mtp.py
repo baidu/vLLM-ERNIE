@@ -62,8 +62,7 @@ class Ernie5_5MTPLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * self.hidden_size
 
-        # Every checkpoint keeps e_proj / h_proj in bf16, with or without an
-        # ignore list for them.
+        # e_proj / h_proj are bf16 in every checkpoint.
         self.enorm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.hnorm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.e_proj = ReplicatedLinear(

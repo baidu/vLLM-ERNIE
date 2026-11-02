@@ -93,8 +93,7 @@ def test_dequantize_block_fp8_is_exact():
 
 
 def test_loader_dequantizes_fp8_into_bf16_params():
-    """indexer wk (stacked shard 0) and MTP e_proj arrive FP8 + scale in any
-    order; bf16 params get dequantized weights, FP8 params pass through."""
+    """FP8 weights of bf16 params are dequantized; FP8 params pass through."""
     from torch import nn
 
     from vllm_ernie.models.ernie5_5.nvidia.model import _dequantize_bf16_layers

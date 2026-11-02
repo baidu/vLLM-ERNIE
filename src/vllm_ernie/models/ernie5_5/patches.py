@@ -144,21 +144,13 @@ _MOONCAKE = "MooncakeConnector"
 
 
 def _patch_mooncake_scheduler(scheduler_cls) -> None:
-    """Make the producer send the KV of a ``FINISHED_STOPPED`` prefill.
-
-    The proxy sends the prefill with ``max_tokens=1``; when that token is EOS
-    or a stop token the request ends ``FINISHED_STOPPED``, which vLLM 0.32.0
-    treats as not processed: P frees the KV while D still pulls it, holding a
-    P sender task until ``VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT``. The decoder
-    recomputes the last prompt token, so sending the KV is always right.
-    """
+    """Send the KV of a prefill that stopped on its one token (vllm#63998)."""
     from vllm.v1.request import RequestStatus
 
     orig = scheduler_cls.request_finished
     if getattr(orig, "_ernie5_stopped_prefill", False):
         return
-    # Harmless once upstream accepts FINISHED_STOPPED too (same result), so it
-    # is always applied; only hint that it can be dropped.
+    # A no-op once upstream accepts FINISHED_STOPPED; only hint at removal.
     try:
         fixed = "!= RequestStatus.FINISHED_LENGTH_CAPPED" not in inspect.getsource(orig)
     except (OSError, TypeError):
@@ -190,8 +182,7 @@ def _patch_mooncake_scheduler(scheduler_cls) -> None:
 
 
 def _patch_mooncake_connector() -> None:
-    # Wrap the lazy loader so the connector module is only imported when a
-    # server actually uses Mooncake.
+    # Patch lazily, only when a server loads the Mooncake connector.
     from vllm.distributed.kv_transfer.kv_connector.factory import (
         KVConnectorFactory,
     )

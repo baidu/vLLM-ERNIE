@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Block FP8 loading of ERNIE 5 checkpoints.
-
-32x32 power-of-two block FP8 loads as MXFP8 on Blackwell; 128x128 block FP8
-uses vLLM's block-FP8 path.
-"""
+"""Block FP8 loading of ERNIE 5 checkpoints (32x32 as MXFP8, 128x128 as is)."""
 
 import torch
 
@@ -93,13 +89,7 @@ def to_mxfp8_weight_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def keeps_fp8_wo_a(quant_config: QuantizationConfig | None) -> bool:
-    """Whether HCA ``wo_a`` runs as block FP8 (the DeepSeek V4 fp8_einsum path).
-
-    Only plain block-FP8 checkpoints that do not list ``linear_o_group_proj``
-    in ``ignored_layers`` do; the entry has no ``.weight`` leaf, so it is
-    matched by name, before or after the weights mapper. Other checkpoints run
-    wo_a in bf16, and an FP8 copy is dequantized at load.
-    """
+    """Whether HCA ``wo_a`` stays block FP8 (not in ``ignored_layers``)."""
     if type(quant_config) is not Fp8Config:
         return False
     ignored = quant_config.ignored_layers or []
@@ -109,10 +99,7 @@ def keeps_fp8_wo_a(quant_config: QuantizationConfig | None) -> bool:
 def dequantize_block_fp8(
     weight: torch.Tensor, scale_inv: torch.Tensor, block: list[int]
 ) -> torch.Tensor:
-    """Dequantize block FP8 ``[N, K]`` with ``[N/bn, K/bk]`` scales to bf16.
-
-    Exact for power-of-two scales: an e4m3 value times a power of two fits bf16.
-    """
+    """Dequantize block FP8 to bf16 (exact for power-of-two scales)."""
     n, k = weight.shape
     bn, bk = block
     scale = scale_inv.float().repeat_interleave(bn, 0)[:n]

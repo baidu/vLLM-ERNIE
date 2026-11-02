@@ -142,9 +142,7 @@ class Ernie5_5HCAAttentionMixin:
     def __init__(self, vllm_config: VllmConfig, prefix: str, **kwargs) -> None:
         super().__init__(vllm_config, prefix, **kwargs)  # type: ignore[call-arg]
         _check_attn_tp()
-        # 128x128 block-FP8 checkpoints quantize wo_a, which the DeepSeek V4
-        # base class already builds for deep_gemm_fp8_o_proj. Otherwise wo_a
-        # runs in bf16 (an FP8 copy is dequantized at load).
+        # wo_a stays FP8 only for 128x128 block-FP8 checkpoints.
         if not keeps_fp8_wo_a(vllm_config.quant_config):
             self.wo_a = ColumnParallelLinear(
                 self.wo_a.input_size,
