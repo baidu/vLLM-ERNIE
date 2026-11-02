@@ -33,13 +33,14 @@ One node with 4 GPUs: attention DP4 (VHA needs attention TP=1) + EP4.
 
 ### FP8 + MTP
 
-128x128 block FP8 with ue8m0 scales, 86 GiB of weights per GPU:
+128x128 block FP8 with ue8m0 scales, about 86 GiB per GPU after loading:
 
 ```bash
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --moe-backend humming --kv-cache-dtype fp8 \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
@@ -50,8 +51,9 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --kv-cache-dtype fp8 \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
-    --max-model-len 65536 --max-num-seqs 16 \
+    --gpu-memory-utilization 0.95 --max-model-len 65536 --max-num-seqs 16 \
     --max-num-batched-tokens 8192 --max-cudagraph-capture-size 512
 ```
 
@@ -63,6 +65,7 @@ K cache with the existing attention option:
 ```bash
 vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --kv-cache-dtype fp8 \
     --attention-config '{"indexer_kv_dtype":"mxfp4"}'
 ```
 
@@ -83,6 +86,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --moe-backend humming --kv-cache-dtype fp8 \
     --speculative-config '{"method":"dspark","model":"/path/to/dspark_checkpoint","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
     --max-model-len 262144
 ```
@@ -94,6 +98,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --kv-cache-dtype fp8 \
     --speculative-config '{"method":"dspark","model":"/path/to/dspark_checkpoint","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
     --gpu-memory-utilization 0.95 --max-model-len 65536 --max-num-seqs 16 \
     --max-num-batched-tokens 8192 --max-cudagraph-capture-size 512
@@ -112,6 +117,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --moe-backend humming --kv-cache-dtype fp8 \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
     --gpu-memory-utilization 0.85
 ```
@@ -123,6 +129,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600
 vllm serve baidu/ERNIE-5.5-Flash-Base \
     --host 0.0.0.0 --port 8000 \
     --data-parallel-size 4 --enable-expert-parallel \
+    --moe-backend humming --kv-cache-dtype fp8 \
     --speculative-config '{"method":"dspark","model":"/path/to/dspark_checkpoint","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
     --gpu-memory-utilization 0.85 --max-num-seqs 128
 ```
@@ -131,7 +138,9 @@ vllm serve baidu/ERNIE-5.5-Flash-Base \
 
 > **Note:** the chat checkpoint is coming soon.
 
-To enable the `ernie5` reasoning and tool-call parsers, append these flags to any `vllm serve` command above:
+The `ernie5` reasoning and tool-call parsers are for the chat checkpoint
+(ERNIE-5.5-Flash); the Base checkpoints have no chat training. To enable them,
+add these flags to its `vllm serve` command:
 
 ```bash
     --reasoning-parser ernie5 \
@@ -140,10 +149,17 @@ To enable the `ernie5` reasoning and tool-call parsers, append these flags to an
 
 ### Request
 
+The Base checkpoints continue text, so send prompts to `/v1/completions`:
+
 ```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"1+1=?"}]}'
+curl http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
+    -d '{"model": "baidu/ERNIE-5.5-Flash-Base",
+         "prompt": "Question: What is 15% of 240?\nAnswer:",
+         "max_tokens": 64, "temperature": 0, "stop": ["\n"]}'
 ```
+
+A correct answer starts with `36`. For the BF16 checkpoint, set `"model"` to
+`baidu/ERNIE-5.5-Flash-Base-BF16`.
 
 ## Test
 
