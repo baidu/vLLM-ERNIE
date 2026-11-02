@@ -34,8 +34,7 @@ One node with 4 GPUs: attention DP4 (VHA needs attention TP=1) + EP4.
 
 ### FP8 + MTP
 
-32x32 block FP8 with ue8m0 scales (loaded as MXFP8 on sm100), 82 GiB of
-weights per GPU:
+128x128 block FP8 with ue8m0 scales, 86 GiB of weights per GPU:
 
 ```bash
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
