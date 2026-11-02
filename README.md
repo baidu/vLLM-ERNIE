@@ -12,8 +12,7 @@ MLA + HCA + DSA, mHC, MoE), with MTP and DSpark speculative decoding and the
 |---|---|---|---|
 | ERNIE-5.5-Flash-Base | FP8 | [baidu/ERNIE-5.5-Flash-Base](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base) | [baidu/ERNIE-5.5-Flash-Base](https://www.modelscope.cn/models/baidu/ERNIE-5.5-Flash-Base) |
 | ERNIE-5.5-Flash-Base-BF16 | BF16 | [baidu/ERNIE-5.5-Flash-Base-BF16](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base-BF16) | [baidu/ERNIE-5.5-Flash-Base-BF16](https://www.modelscope.cn/models/baidu/ERNIE-5.5-Flash-Base-BF16) |
-| ERNIE-5.5-Flash | FP8 | Coming soon | Coming soon |
-| ERNIE-5.5-Flash-BF16 | BF16 | Coming soon | Coming soon |
+| ERNIE-5.5-Flash | BF16 / FP8 / FP4 | Coming soon | Coming soon |
 
 ## Install
 
