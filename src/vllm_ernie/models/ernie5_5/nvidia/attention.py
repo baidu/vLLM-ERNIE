@@ -14,7 +14,11 @@ from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
@@ -33,6 +37,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import downcast_t
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
@@ -92,9 +97,14 @@ def hadamard_rows(x: torch.Tensor) -> torch.Tensor:
     return ops.hadacore_transform(x, inplace=False)[:num_rows]
 
 
-def _check_attn_tp() -> None:
-    if get_tensor_model_parallel_world_size() != 1:
-        raise NotImplementedError("ERNIE 5.5 VHA mixes heads; use attention TP=1.")
+def _check_attn_tp(config: Ernie5_5Config) -> None:
+    tp_size = get_tensor_model_parallel_world_size()
+    for name in ("o_groups", "num_attention_heads", "hybrid_mla_num_attention_heads"):
+        if getattr(config, name) % tp_size:
+            raise ValueError(
+                f"ERNIE 5.5 attention TP size {tp_size} must divide "
+                f"{name}={getattr(config, name)}."
+            )
 
 
 class VHAPostMix(nn.Module):
@@ -102,19 +112,38 @@ class VHAPostMix(nn.Module):
 
     def __init__(self, num_heads: int, rank: int = VHA_RANK) -> None:
         super().__init__()
-        self.U = nn.Parameter(torch.zeros(num_heads, rank), requires_grad=False)
-        self.V = nn.Parameter(torch.zeros(num_heads, rank), requires_grad=False)
-        self.register_buffer("m", torch.eye(num_heads), persistent=False)
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        num_local_heads = num_heads // self.tp_size
+        self.U = nn.Parameter(torch.zeros(num_local_heads, rank), requires_grad=False)
+        self.V = nn.Parameter(torch.zeros(num_local_heads, rank), requires_grad=False)
+        for param in (self.U, self.V):
+            set_weight_attrs(param, {"weight_loader": self._load_local_heads})
+        if self.tp_size == 1:
+            self.register_buffer("m", torch.eye(num_heads), persistent=False)
+
+    def _load_local_heads(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+        rows = param.shape[0]
+        param.data.copy_(loaded[self.tp_rank * rows : (self.tp_rank + 1) * rows])
 
     def fold(self) -> None:
+        if self.tp_size != 1:
+            return
         # Recomputed from U/V each time so repeated calls and weight
         # reloads stay idempotent; in place to keep CUDA graph addresses.
         eye = torch.eye(self.U.shape[0], dtype=self.U.dtype, device=self.U.device)
         self.m.copy_(torch.addmm(eye, self.V, self.U.t()))
 
     def forward(self, o: torch.Tensor) -> torch.Tensor:
-        # o: [num_tokens, num_heads, head_dim]
-        return torch.matmul(self.m, o)
+        # o: [num_tokens, num_local_heads, head_dim]
+        if self.tp_size == 1:
+            return torch.matmul(self.m, o)
+        # TP: o + V @ all_reduce(U^T @ o) over this rank's heads, in fp32.
+        num_tokens = o.shape[0]
+        u = self.U.t().expand(num_tokens, -1, -1)
+        z = tensor_model_parallel_all_reduce(torch.bmm(u, o, out_dtype=torch.float32))
+        v = self.V.float().expand(num_tokens, -1, -1)
+        return torch.bmm(v, z).add_(o).to(o.dtype)
 
 
 def fold_vha(model: nn.Module) -> None:
@@ -140,8 +169,8 @@ class Ernie5_5HCAAttentionMixin:
     """Adds the ERNIE 5 gate and VHA to an HCA attention class."""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str, **kwargs) -> None:
+        _check_attn_tp(vllm_config.model_config.hf_config)
         super().__init__(vllm_config, prefix, **kwargs)  # type: ignore[call-arg]
-        _check_attn_tp()
         # wo_a stays FP8 only for 128x128 block-FP8 checkpoints.
         if not keeps_fp8_wo_a(vllm_config.quant_config):
             self.wo_a = ColumnParallelLinear(
@@ -154,7 +183,8 @@ class Ernie5_5HCAAttentionMixin:
             )
             self.wo_a.is_bmm = True
             self.wo_a.bmm_batch_size = self.n_local_groups
-        self.o_gate = ReplicatedLinear(
+        # Split by group like wo_a.
+        self.o_gate = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_groups * self.o_lora_rank,
             bias=False,
@@ -741,12 +771,13 @@ class Ernie5_5DSAAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        _check_attn_tp()
         config = vllm_config.model_config.hf_config
+        _check_attn_tp(config)
         quant_config = vllm_config.quant_config
         # MLAAttention may canonicalize the dtype on the config it is given.
         cache_config = copy.copy(vllm_config.cache_config)
         self.num_heads = config.mla_num_heads
+        self.num_local_heads = self.num_heads // get_tensor_model_parallel_world_size()
         self.q_lora_rank = config.mla_q_lora_rank
         self.kv_lora_rank = config.mla_kv_lora_rank
         self.qk_nope_head_dim = config.mla_qk_nope_head_dim
@@ -788,7 +819,7 @@ class Ernie5_5DSAAttention(nn.Module):
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
-        self.o_gate = ReplicatedLinear(
+        self.o_gate = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.v_head_dim,
             bias=False,
@@ -804,7 +835,7 @@ class Ernie5_5DSAAttention(nn.Module):
             rope_parameters=config.mla_rope_parameters,
         )
         self.attn_sink = nn.Parameter(
-            torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            torch.empty(self.num_local_heads, dtype=torch.float32), requires_grad=False
         )
 
         _check_sink_backend(
@@ -823,7 +854,7 @@ class Ernie5_5DSAAttention(nn.Module):
             prefix=f"{prefix}.indexer",
         )
         self.mla_attn = Ernie5_5MLAAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_local_heads,
             scale=self.qk_head_dim**-0.5,
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -853,7 +884,7 @@ class Ernie5_5DSAAttention(nn.Module):
         )
         q_c = self.q_a_layernorm(q_c)
         gate = self.o_gate(q_c)
-        q = self.q_b_proj(q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
@@ -861,14 +892,14 @@ class Ernie5_5DSAAttention(nn.Module):
         )
 
         attn_out = torch.empty(
-            (num_tokens, self.num_heads * self.v_head_dim),
+            (num_tokens, self.num_local_heads * self.v_head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         self._indexer_and_attn(
             hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
         )
-        o = self.vha(attn_out.view(num_tokens, self.num_heads, self.v_head_dim))
+        o = self.vha(attn_out.view(num_tokens, self.num_local_heads, self.v_head_dim))
         return self.wo_b(o.flatten(1) * torch.sigmoid(gate))
 
     @eager_break_during_capture

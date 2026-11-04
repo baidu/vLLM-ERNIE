@@ -10,7 +10,11 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
@@ -475,6 +479,8 @@ def load_ernie5_5_weights(
     mxfp8 = getattr(model, "mxfp8", False)
     pending: dict[tuple[str, int | None], list[torch.Tensor | None]] = {}
     block = getattr(model, "fp8_block", [128, 128])
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
     for name, loaded_weight in _dequantize_bf16_layers(
         weights, params_dict, pending, block
     ):
@@ -520,7 +526,9 @@ def load_ernie5_5_weights(
             start = (shard_id or 0) * rows
             param.data[start : start + rows].copy_(loaded_weight)
         elif leaf == "attn_sink":
-            param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
+            # This rank's heads; HCA pads the param past them.
+            n = loaded_weight.shape[0] // tp_size
+            param.data[:n].copy_(loaded_weight[tp_rank * n : (tp_rank + 1) * n])
         elif shard_id is not None:
             param.weight_loader(param, loaded_weight, shard_id)
         else:
