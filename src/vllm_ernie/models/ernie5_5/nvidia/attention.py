@@ -10,6 +10,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -50,6 +51,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
@@ -195,6 +197,8 @@ class Ernie5_5HCAAttentionMixin:
         self.vha = VHAPostMix(self.n_heads)
         if getattr(self, "compressor", None) is not None:
             self.compressor.__class__ = Ernie5_5Compressor
+        # HCA has no indexer, so the gate runs on aux stream 1 during attention.
+        self.gate_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def forward(
         self,
@@ -212,17 +216,29 @@ class Ernie5_5HCAAttentionMixin:
             self._run_parallel_input_projections(hidden_states)
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        gate = self.o_gate(qr)
-        self._prepare_and_attn_fn(
-            hidden_states,
-            qr,
-            kv,
-            qr_scale,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
+        aux_stream = None
+        if (
+            self.aux_stream_list is not None
+            and self.indexer is None
+            and num_tokens <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        ):
+            aux_stream = self.aux_stream_list[1]
+        _, gate = maybe_execute_in_parallel(
+            lambda: self._prepare_and_attn_fn(
+                hidden_states,
+                qr,
+                kv,
+                qr_scale,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                o_padded,
+            ),
+            lambda: torch.sigmoid(self.o_gate(qr)),
+            self.gate_events[0],
+            self.gate_events[1],
+            aux_stream,
         )
         # VHA acts on the head axis and inverse RoPE on the dim axis, so
         # mixing before the fused inverse-RoPE o_proj is exact.
@@ -232,7 +248,7 @@ class Ernie5_5HCAAttentionMixin:
             positions,
             self.rotary_emb.cos_sin_cache,
             self.wo_a,
-            lambda z: self.wo_b(z * torch.sigmoid(gate)),
+            lambda z: self.wo_b(z * gate),
             n_groups=self.n_local_groups,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
