@@ -7,8 +7,10 @@ from functools import partial
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SituAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -114,6 +116,7 @@ def _ernie5_5_routing_kernel(
     scores_ptr,
     bias_ptr,
     scale_ptr,
+    pad_ptr,
     weights_ptr,
     ids_ptr,
     stride,
@@ -121,6 +124,7 @@ def _ernie5_5_routing_kernel(
     TOPK: tl.constexpr,
     TOPK_PAD: tl.constexpr,
     RENORM: tl.constexpr,
+    HAS_PAD: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, E)
@@ -153,6 +157,11 @@ def _ernie5_5_routing_kernel(
         total = tl.maximum(tl.sum(weights, 0), 1e-20)
         weights = tldevice.div_rn(weights, total)
     weights = weights * tl.load(scale_ptr + ids, mask=kmask, other=0.0)
+    if HAS_PAD:
+        # Padding rows select no expert.
+        is_pad = tl.load(pad_ptr + row) != 0
+        weights = tl.where(is_pad, 0.0, weights)
+        ids = tl.where(is_pad, -1, ids)
     tl.store(weights_ptr + row * TOPK + kofs, weights, mask=kmask)
     tl.store(ids_ptr + row * TOPK + kofs, ids, mask=kmask)
 
@@ -163,13 +172,29 @@ def _ernie5_5_routing_torch(
     renormalize: bool,
     bias: torch.Tensor,
     scale: torch.Tensor,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ids = torch.topk(gating_output + bias, topk, dim=-1, sorted=False).indices
     weights = gating_output.gather(1, ids)
     if renormalize:
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
     weights = weights * scale[ids]
-    return weights.float(), ids.int()
+    weights, ids = weights.float(), ids.int()
+    if is_padding is not None:
+        is_padding = is_padding.unsqueeze(1)
+        weights = weights.masked_fill(is_padding, 0)
+        ids = ids.masked_fill(is_padding, -1)
+    return weights, ids
+
+
+def _padding_mask(num_tokens: int) -> torch.Tensor | None:
+    # Same mask as vLLM's built-in routers (VLLM_MOE_SKIP_PADDING).
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        is_padding = get_forward_context().is_padding
+        # Naive DP dispatch routes the gathered batch, longer than the mask.
+        if is_padding is not None and is_padding.numel() >= num_tokens:
+            return is_padding[:num_tokens]
+    return None
 
 
 def ernie5_5_routing(
@@ -185,15 +210,19 @@ def ernie5_5_routing(
 
     ``gating_output`` already holds ``sigmoid(l0) + sigmoid(l1)``. The selected
     scores are renormalized and multiplied by the learnable per-expert scale,
-    indexed by logical expert id. Runs as one Triton kernel when it can.
+    indexed by logical expert id. CUDA graph padding rows get id -1 and
+    weight 0. Runs as one Triton kernel when it can.
     """
     num_tokens, num_experts = gating_output.shape
+    is_padding = _padding_mask(num_tokens)
     if (
         gating_output.dtype != torch.float32
         or gating_output.stride(1) != 1
         or triton.next_power_of_2(num_experts) != num_experts
     ):
-        return _ernie5_5_routing_torch(gating_output, topk, renormalize, bias, scale)
+        return _ernie5_5_routing_torch(
+            gating_output, topk, renormalize, bias, scale, is_padding
+        )
     weights = torch.empty(
         (num_tokens, topk), dtype=torch.float32, device=gating_output.device
     )
@@ -205,6 +234,7 @@ def ernie5_5_routing(
             gating_output,
             bias,
             scale,
+            is_padding if is_padding is not None else ids,
             weights,
             ids,
             gating_output.stride(0),
@@ -212,6 +242,7 @@ def ernie5_5_routing(
             TOPK=topk,
             TOPK_PAD=triton.next_power_of_2(topk),
             RENORM=renormalize,
+            HAS_PAD=is_padding is not None,
             enable_reflect_ftz=False,
             # One warp per row, about 2x faster at 8K tokens than 4 warps.
             num_warps=1,

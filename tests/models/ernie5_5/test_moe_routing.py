@@ -69,3 +69,42 @@ def test_fused_routing_matches_torch(num_tokens, renormalize, topk, ties):
     assert ids.dtype == torch.int32 and weights.dtype == torch.float32
     assert torch.equal(ids, ref_ids)
     assert torch.equal(weights, ref_w)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_routing_masks_padding_rows(monkeypatch, fused):
+    from vllm_ernie.models.ernie5_5.nvidia import moe
+
+    set_random_seed(0)
+    logits = torch.randn(8, 1024, device="cuda", dtype=torch.float32) * 4
+    scores = split_sigmoid_sum(logits, 512)
+    if not fused:
+        scores = scores.double()
+    bias = torch.randn(512, device="cuda", dtype=scores.dtype) * 0.1
+    scale = torch.rand(512, device="cuda", dtype=scores.dtype) + 2.5
+    ref_w, ref_ids = ernie5_5_routing(None, scores, 10, True, bias=bias, scale=scale)
+    is_padding = torch.zeros(16, dtype=torch.bool, device="cuda")
+    is_padding[5:] = True
+    monkeypatch.setattr(moe, "_padding_mask", lambda n: is_padding[:n])
+    weights, ids = ernie5_5_routing(None, scores, 10, True, bias=bias, scale=scale)
+    assert ids.dtype == torch.int32 and weights.dtype == torch.float32
+    torch.testing.assert_close(ids[:5], ref_ids[:5])
+    torch.testing.assert_close(weights[:5], ref_w[:5])
+    assert (ids[5:] == -1).all() and (weights[5:] == 0).all()
+
+
+def test_padding_mask_shorter_than_tokens(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_ernie.models.ernie5_5.nvidia import moe
+
+    is_padding = torch.zeros(16, dtype=torch.bool, device="cuda")
+    monkeypatch.setattr(moe.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(moe, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        moe, "get_forward_context", lambda: SimpleNamespace(is_padding=is_padding)
+    )
+    assert moe._padding_mask(8).shape == (8,)
+    assert moe._padding_mask(16).shape == (16,)
+    # Naive DP dispatch: the router sees all DP ranks' tokens.
+    assert moe._padding_mask(64) is None
