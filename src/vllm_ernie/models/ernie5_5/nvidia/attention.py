@@ -23,6 +23,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -35,6 +36,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import downcast_to_mxfp
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -49,7 +53,11 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
+from vllm.utils.deep_gemm import (
+    get_paged_mqa_logits_metadata,
+    get_tma_aligned_size,
+    has_deep_gemm,
+)
 from vllm.utils.math_utils import round_up
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import (
@@ -154,6 +162,128 @@ def fold_vha(model: nn.Module) -> None:
             module.fold()
 
 
+@triton.jit
+def _vha_inv_rope_quant_kernel(
+    o_ptr,
+    m_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    out_ptr,
+    scale_ptr,
+    num_tokens,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    out_stride_group,
+    scale_stride_group,
+    scale_stride_k,
+    NUM_HEADS: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # One program per (token, 128-wide chunk of every head).
+    tok = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    heads = tl.arange(0, NUM_HEADS)
+    group = heads // HEADS_PER_GROUP
+    head_in_group = heads % HEADS_PER_GROUP
+    # Byte `chunk` of each head's packed int32 UE8M0 scale (little endian).
+    scale_idx = group * scale_stride_group + head_in_group * scale_stride_k + tok
+    scale_bytes = scale_ptr + scale_idx * 4 + chunk
+    if tok >= num_tokens:
+        # TMA-aligned padding rows of the scale buffer.
+        tl.store(scale_bytes, tl.zeros((NUM_HEADS,), dtype=tl.uint8))
+        return
+    cols = chunk * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(
+        o_ptr + tok * o_stride_token + heads[:, None] * o_stride_head + cols[None, :]
+    )
+    mix = tl.load(m_ptr + heads[:, None] * NUM_HEADS + heads[None, :])
+    # Head mixing with fp32 accumulation, then inverse RoPE on interleaved pairs.
+    y = tl.dot(mix.to(x.dtype), x, out_dtype=tl.float32)
+    if chunk * BLOCK + BLOCK > NOPE_DIM:
+        rope = chunk * (BLOCK // 2) + tl.arange(0, BLOCK // 2) - NOPE_DIM // 2
+        is_rope = rope >= 0
+        pos = tl.load(positions_ptr + tok)
+        cs = cos_sin_ptr + pos * cache_stride_pos + tl.maximum(rope, 0)
+        cos = tl.load(cs, mask=is_rope, other=1.0)[None, :]
+        sin = tl.load(cs + HALF_ROPE, mask=is_rope, other=0.0)[None, :]
+        y_even, y_odd = tl.split(tl.reshape(y, (NUM_HEADS, BLOCK // 2, 2)))
+        y = tl.reshape(
+            tl.join(y_even * cos + y_odd * sin, y_odd * cos - y_even * sin),
+            (NUM_HEADS, BLOCK),
+        )
+    # Per-(head, 128) UE8M0 scale, as fused_inv_rope_fp8_quant.
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+    scale = tl.math.exp2(tl.ceil(tl.log2(amax * (1.0 / FP8_MAX))))
+    y_q = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX)
+    out_rows = out_ptr + group * out_stride_group + tok * HEADS_PER_GROUP * HEAD_DIM
+    out_rows += head_in_group * HEAD_DIM
+    tl.store(out_rows[:, None] + cols[None, :], y_q.to(tl.float8e4nv))
+    exp_byte = (scale.to(tl.int32, bitcast=True) >> 23) & 0xFF
+    tl.store(scale_bytes, exp_byte.to(tl.uint8))
+
+
+def vha_inv_rope_fp8_quant(
+    o: torch.Tensor,
+    mix: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> QuantizedActivation:
+    """VHA head mixing + `fused_inv_rope_fp8_quant` (SM100 layout) in one kernel."""
+    num_tokens, num_heads, head_dim = o.shape
+    block = 128
+    heads_per_group = num_heads // n_groups
+    assert head_dim == nope_dim + rope_dim and head_dim == 4 * block
+    assert o.stride(-1) == 1 and nope_dim % 2 == 0
+    width = heads_per_group * head_dim
+    out = torch.empty(
+        (n_groups, num_tokens, width), dtype=torch.float8_e4m3fn, device=o.device
+    )
+    aligned = get_tma_aligned_size(num_tokens, torch.int32.itemsize)
+    scale = torch.empty(
+        (n_groups, heads_per_group, aligned), dtype=torch.int32, device=o.device
+    )
+    if aligned:
+        _vha_inv_rope_quant_kernel[(aligned, head_dim // block)](
+            o,
+            mix,
+            positions,
+            cos_sin_cache,
+            out,
+            scale.view(torch.uint8),
+            num_tokens,
+            o.stride(0),
+            o.stride(1),
+            cos_sin_cache.stride(0),
+            out.stride(0),
+            scale.stride(0),
+            scale.stride(1),
+            NUM_HEADS=num_heads,
+            HEADS_PER_GROUP=heads_per_group,
+            HEAD_DIM=head_dim,
+            NOPE_DIM=nope_dim,
+            HALF_ROPE=rope_dim // 2,
+            BLOCK=block,
+            FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+            num_warps=4,
+        )
+    return QuantizedActivation(
+        data=out.transpose(0, 1),
+        scale=scale.permute(2, 0, 1)[:num_tokens],
+        orig_dtype=o.dtype,
+        orig_shape=out.transpose(0, 1).shape,
+        quant_key=kFp8Dynamic128Sym,
+    )
+
+
 class Ernie5_5Compressor(DeepseekCompressor):
     """Keeps C128 compression in piecewise CUDA graphs (upstream #59709)."""
 
@@ -195,6 +325,21 @@ class Ernie5_5HCAAttentionMixin:
             prefix=f"{prefix}.o_gate",
         )
         self.vha = VHAPostMix(self.n_heads)
+        # One kernel for VHA + inverse RoPE + FP8 quant (TP=1, FP8 wo_a, SM100).
+        # Its tl.dot over heads needs a power-of-two head count >= 16.
+        num_heads = self.n_local_heads
+        self._fuse_vha_quant = (
+            self.vha.tp_size == 1
+            and self.wo_a.weight.dtype == torch.float8_e4m3fn
+            and self._tma_aligned_scales
+            and self._einsum_recipe[2] == 128
+            and self.head_dim == 512
+            and self.nope_head_dim + self.rope_head_dim == self.head_dim
+            and self.nope_head_dim % 2 == 0
+            and num_heads >= 16
+            and num_heads & (num_heads - 1) == 0
+            and num_heads % self.n_local_groups == 0
+        )
         if getattr(self, "compressor", None) is not None:
             self.compressor.__class__ = Ernie5_5Compressor
         # HCA has no indexer, so the gate runs on aux stream 1 during attention.
@@ -242,7 +387,19 @@ class Ernie5_5HCAAttentionMixin:
         )
         # VHA acts on the head axis and inverse RoPE on the dim axis, so
         # mixing before the fused inverse-RoPE o_proj is exact.
-        o = self.vha(o_padded[:, : self.n_local_heads, :])
+        o = o_padded[:, : self.n_local_heads, :]
+        if self._fuse_vha_quant:
+            o = vha_inv_rope_fp8_quant(
+                o,
+                self.vha.m,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+        else:
+            o = self.vha(o)
         return deep_gemm_fp8_o_proj(
             o,
             positions,
