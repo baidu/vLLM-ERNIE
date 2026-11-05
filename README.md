@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Baidu ERNIE" width="600">
+</p>
+
 # vLLM-ERNIE
 
 vLLM plugin for ERNIE models, one package per model under
