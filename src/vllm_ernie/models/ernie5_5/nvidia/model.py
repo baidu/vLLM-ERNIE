@@ -141,7 +141,10 @@ class Ernie5_5DecoderLayer(nn.Module):
             )
         else:
             self.ffn = Ernie5_5MoE(
-                config, quant_config=quant_config, prefix=f"{prefix}.ffn"
+                config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn",
+                aux_stream=aux_stream_list[0] if aux_stream_list else None,
             )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)

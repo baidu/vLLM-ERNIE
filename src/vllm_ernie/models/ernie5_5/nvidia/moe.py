@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.triton_utils import tl, tldevice, triton
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
@@ -277,6 +278,7 @@ class Ernie5_5MoE(nn.Module):
         config: Ernie5_5Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        aux_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         if not getattr(config, "moe_split_feature_routing", False):
@@ -372,12 +374,25 @@ class Ernie5_5MoE(nn.Module):
                 self.latent_norm, self.fc2_latent_proj
             ),
         )
+        # fc1 runs on this stream next to the router GEMM for small batches.
+        self.aux_stream = aux_stream
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_experts = self.n_routed_experts
-        logits, _ = self.gate(hidden_states)
-        scores = split_sigmoid_sum(logits, num_experts)
-        routed_hidden_states, _ = self.fc1_latent_proj(hidden_states)
+        def route() -> torch.Tensor:
+            logits, _ = self.gate(hidden_states)
+            return split_sigmoid_sum(logits, self.n_routed_experts)
+
+        aux_stream = self.aux_stream
+        if hidden_states.shape[0] > envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD:
+            aux_stream = None
+        scores, routed_hidden_states = maybe_execute_in_parallel(
+            route,
+            lambda: self.fc1_latent_proj(hidden_states)[0],
+            self.events[0],
+            self.events[1],
+            aux_stream,
+        )
         return self.experts(
             hidden_states=routed_hidden_states,
             router_logits=scores,
