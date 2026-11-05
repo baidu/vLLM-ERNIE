@@ -18,6 +18,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.triton_utils import tl, tldevice, triton
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
@@ -65,6 +66,112 @@ class Ernie5_5MLP(nn.Module):
         return x
 
 
+@triton.jit
+def _sigmoid(x):
+    # torch's fp32 CUDA sigmoid: 1 / (1 + expf(-x)), IEEE division.
+    return tldevice.div_rn(1.0, 1.0 + tldevice.exp(-x))
+
+
+@triton.jit
+def _split_sigmoid_sum_kernel(logits_ptr, out_ptr, stride, E: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, E)
+    l0 = tl.load(logits_ptr + row * stride + offs)
+    l1 = tl.load(logits_ptr + row * stride + E + offs)
+    tl.store(out_ptr + row * E + offs, _sigmoid(l0) + _sigmoid(l1))
+
+
+def split_sigmoid_sum(logits: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """``sigmoid(logits[:, :E]) + sigmoid(logits[:, E:])`` in one kernel."""
+    num_tokens = logits.shape[0]
+    out = torch.empty(
+        (num_tokens, num_experts), dtype=torch.float32, device=logits.device
+    )
+    if (
+        num_tokens
+        and logits.stride(1) == 1
+        and triton.next_power_of_2(num_experts) == num_experts
+    ):
+        _split_sigmoid_sum_kernel[(num_tokens,)](
+            logits,
+            out,
+            logits.stride(0),
+            E=num_experts,
+            # Keep denormal results, as torch does.
+            enable_reflect_ftz=False,
+        )
+    elif num_tokens:
+        torch.add(
+            logits[:, :num_experts].sigmoid(),
+            logits[:, num_experts:].sigmoid(),
+            out=out,
+        )
+    return out
+
+
+@triton.jit
+def _ernie5_5_routing_kernel(
+    scores_ptr,
+    bias_ptr,
+    scale_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride,
+    E: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    RENORM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, E)
+    kofs = tl.arange(0, TOPK_PAD)
+    scores = tl.load(scores_ptr + row * stride + offs)
+    sel = scores + tl.load(bias_ptr + offs)
+    ids = tl.full((TOPK_PAD,), E, dtype=tl.int32)
+    vals = tl.zeros((TOPK_PAD,), dtype=tl.float32)
+    weights = tl.zeros((TOPK_PAD,), dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        best = tl.max(sel, 0)
+        idx = tl.minimum(tl.min(tl.where(sel == best, offs, E), 0), E - 1)
+        hit = offs == idx
+        ids = tl.where(kofs == k, idx, ids)
+        vals = tl.where(kofs == k, best, vals)
+        weights = tl.where(kofs == k, tl.sum(tl.where(hit, scores, 0.0), 0), weights)
+        sel = tl.where(hit, float("-inf"), sel)
+    # Reorder to torch.topk(sorted=False) slots: experts above the k-th value
+    # by index, then those equal to it by index.
+    kmask = kofs < TOPK
+    above = kmask & (vals > best)
+    key = tl.where(above, ids, ids + E)
+    slot = tl.sum((key[None, :] < key[:, None]).to(tl.int32), 1)
+    move = slot[None, :] == kofs[:, None]
+    ids = tl.sum(tl.where(move, ids[None, :], 0), 1)
+    weights = tl.sum(tl.where(move, weights[None, :], 0.0), 1)
+    if RENORM:
+        # tl.sum's tree over the zero-padded slots adds in the same order as
+        # torch's sum(-1); `/` would be approximate, torch divides with IEEE.
+        total = tl.maximum(tl.sum(weights, 0), 1e-20)
+        weights = tldevice.div_rn(weights, total)
+    weights = weights * tl.load(scale_ptr + ids, mask=kmask, other=0.0)
+    tl.store(weights_ptr + row * TOPK + kofs, weights, mask=kmask)
+    tl.store(ids_ptr + row * TOPK + kofs, ids, mask=kmask)
+
+
+def _ernie5_5_routing_torch(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    bias: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = torch.topk(gating_output + bias, topk, dim=-1, sorted=False).indices
+    weights = gating_output.gather(1, ids)
+    if renormalize:
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
+    weights = weights * scale[ids]
+    return weights.float(), ids.int()
+
+
 def ernie5_5_routing(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -78,14 +185,38 @@ def ernie5_5_routing(
 
     ``gating_output`` already holds ``sigmoid(l0) + sigmoid(l1)``. The selected
     scores are renormalized and multiplied by the learnable per-expert scale,
-    indexed by logical expert id.
+    indexed by logical expert id. Runs as one Triton kernel when it can.
     """
-    ids = torch.topk(gating_output + bias, topk, dim=-1, sorted=False).indices
-    weights = gating_output.gather(1, ids)
-    if renormalize:
-        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-20)
-    weights = weights * scale[ids]
-    return weights.float(), ids.int()
+    num_tokens, num_experts = gating_output.shape
+    if (
+        gating_output.dtype != torch.float32
+        or gating_output.stride(1) != 1
+        or triton.next_power_of_2(num_experts) != num_experts
+    ):
+        return _ernie5_5_routing_torch(gating_output, topk, renormalize, bias, scale)
+    weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+    )
+    ids = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    if num_tokens:
+        _ernie5_5_routing_kernel[(num_tokens,)](
+            gating_output,
+            bias,
+            scale,
+            weights,
+            ids,
+            gating_output.stride(0),
+            E=num_experts,
+            TOPK=topk,
+            TOPK_PAD=triton.next_power_of_2(topk),
+            RENORM=renormalize,
+            enable_reflect_ftz=False,
+            # One warp per row, about 2x faster at 8K tokens than 4 warps.
+            num_warps=1,
+        )
+    return weights, ids
 
 
 class Ernie5_5RoutedOutputTransform(nn.Module):
@@ -214,7 +345,7 @@ class Ernie5_5MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_experts = self.n_routed_experts
         logits, _ = self.gate(hidden_states)
-        scores = logits[:, :num_experts].sigmoid() + logits[:, num_experts:].sigmoid()
+        scores = split_sigmoid_sum(logits, num_experts)
         routed_hidden_states, _ = self.fc1_latent_proj(hidden_states)
         return self.experts(
             hidden_states=routed_hidden_states,
