@@ -9,7 +9,7 @@ from itertools import islice
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -464,12 +464,15 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
 def ernie5_5_expert_mapping(
     model: nn.Module, config: Ernie5_5Config
 ) -> list[tuple[str, str, int, str]]:
+    # EPLB redundant experts load the checkpoint weights of their logical ids.
+    eplb_config = get_current_vllm_config().parallel_config.eplb_config
     return fused_moe_make_expert_params_mapping(
         model,
         ckpt_gate_proj_name="w1",
         ckpt_down_proj_name="w2",
         ckpt_up_proj_name="w3",
         num_experts=config.n_routed_experts,
+        num_redundant_experts=eplb_config.num_redundant_experts,
     )
 
 
@@ -657,6 +660,21 @@ ernie5_5_mapper = WeightsMapper(
 class Ernie5_5MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list[Ernie5_5MoE]
 
+    def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
+        self.num_expert_groups = 1
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers = []
+        for layer in layers:
+            if isinstance(layer, Ernie5_5DecoderLayer) and isinstance(
+                layer.ffn, Ernie5_5MoE
+            ):
+                self.moe_mlp_layers.append(layer.ffn)
+                self.moe_layers.append(layer.ffn.experts)
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(
+            self.moe_mlp_layers[0] if self.moe_mlp_layers else None
+        )
+
     def extract_moe_parameters(self, example_moe: Ernie5_5MoE | None) -> None:
         if example_moe is None:
             self.num_moe_layers = 0
@@ -721,22 +739,7 @@ class Ernie5_5ForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
-        self.set_moe_parameters()
-
-    def set_moe_parameters(self) -> None:
-        self.num_expert_groups = 1
-        self.moe_layers: list[nn.Module] = []
-        self.moe_mlp_layers: list[Ernie5_5MoE] = []
-        for layer in self.model.layers:
-            if isinstance(layer, Ernie5_5DecoderLayer) and isinstance(
-                layer.ffn, Ernie5_5MoE
-            ):
-                self.moe_mlp_layers.append(layer.ffn)
-                self.moe_layers.append(layer.ffn.experts)
-        self.num_moe_layers = len(self.moe_layers)
-        self.extract_moe_parameters(
-            self.moe_mlp_layers[0] if self.moe_mlp_layers else None
-        )
+        self.set_moe_parameters(self.model.layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

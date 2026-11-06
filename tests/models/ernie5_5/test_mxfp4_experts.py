@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.platforms import current_platform
 
@@ -107,9 +108,10 @@ def test_mxfp4_expert_weight_names(monkeypatch):
     monkeypatch.setattr(model_mod, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(model_mod, "get_tensor_model_parallel_rank", lambda: 0)
     model = _model()
-    mapping = model_mod.ernie5_5_expert_mapping(
-        model, SimpleNamespace(n_routed_experts=2)
-    )
+    with set_current_vllm_config(VllmConfig()):
+        mapping = model_mod.ernie5_5_expert_mapping(
+            model, SimpleNamespace(n_routed_experts=2)
+        )
     n, k = 64, 128
     weights = []
     for e in range(2):

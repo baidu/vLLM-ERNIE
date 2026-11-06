@@ -290,11 +290,9 @@ class Ernie5_5MoE(nn.Module):
         if getattr(config, "scoring_func", "sigmoid") != "sigmoid":
             raise NotImplementedError("ERNIE 5.5 MoE only supports sigmoid scoring.")
 
-        vllm_config = get_current_vllm_config()
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.enable_eplb:
-            # The per-expert scale is indexed by logical expert id.
-            raise NotImplementedError("ERNIE 5.5 MoE does not support EPLB yet.")
+        parallel_config = get_current_vllm_config().parallel_config
+        # EPLB remaps ids after routing; bias and scale stay indexed by logical id.
+        self.enable_eplb = parallel_config.enable_eplb
 
         hidden_size = config.hidden_size
         latent_size = config.moe_latent_size
@@ -304,9 +302,9 @@ class Ernie5_5MoE(nn.Module):
         self.ep_size = get_ep_group().world_size
         self.ep_rank = get_ep_group().rank_in_group
         self.n_logical_experts = num_experts
-        self.n_redundant_experts = 0
-        self.n_physical_experts = num_experts
-        self.n_local_physical_experts = num_experts // self.ep_size
+        self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+        self.n_physical_experts = num_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
         self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
         self.physical_expert_end = (
             self.physical_expert_start + self.n_local_physical_experts
@@ -368,6 +366,8 @@ class Ernie5_5MoE(nn.Module):
                 scale=self.gate.routed_scaling_factor_param,
             ),
             router_logits_dtype=torch.float32,
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
             # fc1 runs outside the runner (see forward()); the norm + fc2 are
             # non-linear, so they run after the expert combine.
             routed_output_transform=Ernie5_5RoutedOutputTransform(

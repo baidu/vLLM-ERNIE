@@ -31,6 +31,7 @@ from vllm.sequence import IntermediateTensors
 from .attention import fold_vha
 from .model import (
     Ernie5_5DecoderLayer,
+    Ernie5_5MixtureOfExperts,
     ernie5_5_expert_mapping,
     ernie5_5_mapper,
     fp32_param,
@@ -201,7 +202,7 @@ class Ernie5_5MultiTokenPredictor(nn.Module):
         return head.multimax(logits)
 
 
-class Ernie5_5MTP(nn.Module):
+class Ernie5_5MTP(nn.Module, Ernie5_5MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -210,6 +211,7 @@ class Ernie5_5MTP(nn.Module):
         self.model = Ernie5_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.set_moe_parameters(layer.mtp_block for layer in self.model.layers.values())
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
