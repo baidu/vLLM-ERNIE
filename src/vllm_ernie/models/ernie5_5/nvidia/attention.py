@@ -910,11 +910,15 @@ class Ernie5_5Indexer(nn.Module):
             prefix=f"{prefix}.wk_weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        # Partial RoPE on the leading rope_dim of each head.
         self.rotary_emb = get_rope(
-            self.rope_dim,
+            self.head_dim,
             max_position=config.max_position_embeddings,
             is_neox_style=True,
-            rope_parameters=config.mla_rope_parameters,
+            rope_parameters={
+                **config.mla_rope_parameters,
+                "partial_rotary_factor": self.rope_dim / self.head_dim,
+            },
         )
         # The hadacore transform is orthonormal, so only the usual softmax and
         # head-count scaling is folded into the weights.
@@ -957,12 +961,8 @@ class Ernie5_5Indexer(nn.Module):
         k, weights = kw.split([self.head_dim, self.n_head], dim=-1)
         k = self.k_norm(k)
 
-        nope_dim = self.head_dim - self.rope_dim
-        q_pe, q_nope = q.split([self.rope_dim, nope_dim], dim=-1)
-        k_pe, k_nope = k.split([self.rope_dim, nope_dim], dim=-1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        q = torch.cat([q_pe.reshape(-1, self.n_head, self.rope_dim), q_nope], -1)
-        k = torch.cat([k_pe.reshape(-1, self.rope_dim), k_nope], dim=-1)
+        # In place on CUDA, so no split + cat around the rope part.
+        q, k = self.rotary_emb(positions, q, k)
         q = hadamard_rows(q.view(-1, self.head_dim))
         k = hadamard_rows(k)
 
