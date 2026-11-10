@@ -111,6 +111,31 @@ def fp8_block_size(vllm_config: VllmConfig) -> list[int]:
     return getattr(vllm_config.quant_config, "weight_block_size", None) or [128, 128]
 
 
+def use_ernie5_5_mxfp4_experts(vllm_config: VllmConfig) -> bool:
+    """Mark MXFP4 routed experts (`expert_dtype: mxfp4`); returns whether set.
+
+    vLLM's `Fp8Config` returns `Mxfp4MoEMethod` for the routed experts once
+    `store_dtype` is "mxfp4", so this must run before the layers are built.
+    """
+    quant_config = vllm_config.quant_config
+    if type(quant_config) is not Fp8Config:
+        return False
+    # Top level as in DeepSeek V4, or inside `quantization_config`.
+    hf_config = vllm_config.model_config.hf_config
+    hf_quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+    expert_dtype = hf_quant_cfg.get(
+        "expert_dtype", getattr(hf_config, "expert_dtype", None)
+    )
+    if expert_dtype not in (None, "fp8", "mxfp4"):
+        raise ValueError(
+            f"Unsupported ERNIE 5.5 expert_dtype={expert_dtype!r}; "
+            "expected 'fp8' or 'mxfp4'."
+        )
+    if expert_dtype == "mxfp4":
+        quant_config.store_dtype = "mxfp4"
+    return quant_config.store_dtype == "mxfp4"
+
+
 def use_ernie5_5_mxfp8(vllm_config: VllmConfig) -> bool:
     """Swap in `Ernie5_5MXFP8Config` when it applies; returns whether it did."""
     hf_quant_cfg = getattr(

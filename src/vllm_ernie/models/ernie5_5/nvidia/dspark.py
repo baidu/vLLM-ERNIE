@@ -40,12 +40,14 @@ from .model import (
     load_ernie5_5_weights,
     topk_buffers,
 )
+from .quant_config import use_ernie5_5_mxfp4_experts
 
 logger = init_logger(__name__)
 
 # Draft-level checkpoint weights renamed outside `ernie5_5_mapper`.
 _DSPARK_RENAMES = {
     "model.feature_projection.weight": "model.main_proj.weight",
+    "model.feature_projection.weight_scale_inv": "model.main_proj.weight_scale_inv",
     "model.feature_norm.weight": "model.main_norm.weight",
     "model.confidence_head.projection.weight": "model.confidence_head.proj.weight",
 }
@@ -94,8 +96,12 @@ class Ernie5_5DSparkModel(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            # BF16 even in FP8 checkpoints.
-            quant_config=None,
+            # FP8 in MXFP4-expert checkpoints, BF16 in the others.
+            quant_config=(
+                vllm_config.quant_config
+                if use_ernie5_5_mxfp4_experts(vllm_config)
+                else None
+            ),
             prefix=maybe_prefix(prefix, "main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -220,6 +226,7 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.mxfp4_experts = use_ernie5_5_mxfp4_experts(vllm_config)
         self.model = Ernie5_5DSparkModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )

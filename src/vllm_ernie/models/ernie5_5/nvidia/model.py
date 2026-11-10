@@ -58,6 +58,7 @@ from .quant_config import (
     dequantize_block_fp8,
     fp8_block_size,
     to_mxfp8_weight_scale,
+    use_ernie5_5_mxfp4_experts,
     use_ernie5_5_mxfp8,
 )
 
@@ -278,6 +279,7 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         self.config = config
         self.mxfp8 = use_ernie5_5_mxfp8(vllm_config)
+        self.mxfp4_experts = use_ernie5_5_mxfp4_experts(vllm_config)
         self.fp8_block = fp8_block_size(vllm_config)
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -482,6 +484,7 @@ def load_ernie5_5_weights(
     params_dict = dict(model.named_parameters())
     loaded_params: set[str] = set()
     mxfp8 = getattr(model, "mxfp8", False)
+    mxfp4_experts = getattr(model, "mxfp4_experts", False)
     pending: dict[tuple[str, int | None], list[torch.Tensor | None]] = {}
     block = getattr(model, "fp8_block", [128, 128])
     tp_size = get_tensor_model_parallel_world_size()
@@ -496,6 +499,11 @@ def load_ernie5_5_weights(
             name = name.removesuffix("_inv")
             loaded_weight = to_mxfp8_weight_scale(loaded_weight)
         if ".experts." in name:
+            if mxfp4_experts:
+                # Packed FP4 pairs (int8) and e8m0 scales for `Mxfp4MoEMethod`.
+                name = name.removesuffix("_inv")
+                if loaded_weight.dtype == torch.int8:
+                    loaded_weight = loaded_weight.view(torch.uint8)
             for param_name, weight_name, expert_id, expert_shard_id in expert_mapping:
                 if weight_name not in name:
                     continue

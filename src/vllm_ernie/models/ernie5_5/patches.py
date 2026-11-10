@@ -106,6 +106,20 @@ def _undo_dspark_rewrite(spec_config) -> None:
     draft._verify_quantization()
 
 
+def _default_bundled_dspark_tokens(spec_config) -> None:
+    # vLLM only reads the block size from a draft config; without a draft path
+    # it needs num_speculative_tokens first, so take it from the target.
+    target = spec_config.target_model_config
+    if (
+        spec_config.method == "dspark"
+        and spec_config.model is None
+        and spec_config.num_speculative_tokens is None
+        and target is not None
+        and getattr(target.hf_config, "bundles_dspark_draft", False)
+    ):
+        spec_config.num_speculative_tokens = target.hf_config.dspark_block_size
+
+
 def _patch_speculative_config() -> None:
     import vllm.config.speculative as spec_mod
     from vllm.config.speculative import SpeculativeConfig
@@ -134,6 +148,15 @@ def _patch_speculative_config() -> None:
         orig_update_arch(self)
 
     SpeculativeConfig.update_arch_ = update_arch_
+
+    orig_post_init = SpeculativeConfig.__post_init__
+
+    @functools.wraps(orig_post_init)
+    def __post_init__(self):
+        _default_bundled_dspark_tokens(self)
+        orig_post_init(self)
+
+    SpeculativeConfig.__post_init__ = __post_init__
 
 
 def _register_parsers() -> None:

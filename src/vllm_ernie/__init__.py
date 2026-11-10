@@ -6,6 +6,8 @@
 under ``models/``; model code is imported when an architecture resolves.
 """
 
+import logging
+
 _registered = False
 
 
@@ -14,6 +16,15 @@ def register() -> None:
     if _registered:
         return
     _registered = True
+
+    # vLLM configures only the `vllm` logger; share its handlers so the
+    # plugin's INFO logs are not dropped.
+    vllm_logger = logging.getLogger("vllm")
+    plugin_logger = logging.getLogger(__name__)
+    if not plugin_logger.handlers:
+        plugin_logger.handlers = list(vllm_logger.handlers)
+        plugin_logger.setLevel(vllm_logger.level)
+        plugin_logger.propagate = False
 
     from vllm_ernie.models import ernie5_5
 
