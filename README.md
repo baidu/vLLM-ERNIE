@@ -105,6 +105,7 @@ vllm serve baidu/ERNIE-5.5-Flash-Preview \
     --reasoning-parser ernie5 \
     --tool-call-parser ernie5 \
     --enable-auto-tool-choice \
+    --attention-config '{"indexer_kv_dtype":"mxfp4"}' \
     --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
 ```
 
@@ -157,6 +158,11 @@ vllm serve baidu/ERNIE-5.5-Flash-Preview-BF16 \
 
 The chat models use DSpark speculative decoding. Drop
 `--speculative-config` to serve without a draft.
+
+The FP4 command passes `--attention-config '{"indexer_kv_dtype":"mxfp4"}'`,
+which keeps the DSA indexer's query and key cache in MXFP4. It needs
+Blackwell-architecture data-center GPUs and the default context parallel
+sizes; elsewhere, drop it to keep the FP8 indexer.
 
 Thinking is returned in `reasoning_content`, the answer in `content` and tool
 calls in `message.tool_calls`. Thinking is on by default; pass

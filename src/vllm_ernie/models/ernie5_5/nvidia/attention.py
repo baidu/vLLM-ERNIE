@@ -673,7 +673,8 @@ class Ernie5_5Indexer(nn.Module):
         if self.use_fp4_kv:
             q, q_scale = self._quantize_fp4(q, k)
             # Group-32 Q scales travel with Q and cannot be folded into weights.
-            weights = weights * self.weights_scale
+            # The FP4 logits kernels take FP32 weights.
+            weights = weights.float() * self.weights_scale
             q_with_scale = (q, q_scale)
         else:
             q, q_scale = per_token_group_quant_fp8(
