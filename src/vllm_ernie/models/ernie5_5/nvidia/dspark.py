@@ -30,6 +30,8 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.nvidia.dspark import _insert_context_kv
 
+from vllm_ernie.models.ernie5_5.patches import patch_dspark_sample_logits
+
 from .attention import fold_vha
 from .model import (
     Ernie5_5DecoderLayer,
@@ -232,6 +234,7 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        patch_dspark_sample_logits()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -261,9 +264,13 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # No multimax, like SGLang: the target's is non-monotonic past a
-        # ckpt-dependent logit and demotes confident draft tokens.
+        # Multimax comes after the Markov bias, in postprocess_draft_logits.
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+
+    def postprocess_draft_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        # Keep masked (-inf) logits masked; multimax would make them NaN.
+        neg_inf = logits.isneginf()
+        return self.lm_head.multimax(logits).masked_fill_(neg_inf, float("-inf"))
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
