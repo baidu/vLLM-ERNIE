@@ -288,6 +288,29 @@ def _patch_enable_thinking() -> None:
         )
 
 
+def patch_dspark_sample_logits() -> None:
+    """Run the draft's ``postprocess_draft_logits`` before DSpark sampling.
+
+    Called from the ERNIE draft so only processes that load it import the
+    speculator.
+    """
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    orig = DSparkSpeculator._sample_logits
+    if getattr(orig, "_ernie5_draft_logits", False):
+        return
+
+    @functools.wraps(orig)
+    def _sample_logits(self, logits, *args, **kwargs):
+        postprocess = getattr(self.model, "postprocess_draft_logits", None)
+        if postprocess is not None:
+            logits = postprocess(logits)
+        return orig(self, logits, *args, **kwargs)
+
+    _sample_logits._ernie5_draft_logits = True  # type: ignore[attr-defined]
+    DSparkSpeculator._sample_logits = _sample_logits
+
+
 _MOONCAKE = "MooncakeConnector"
 
 
