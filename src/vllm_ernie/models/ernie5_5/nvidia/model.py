@@ -26,6 +26,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
@@ -54,6 +55,11 @@ from vllm_ernie.models.ernie5_5.mhc import (
 )
 
 from .attention import Ernie5_5DSAAttention, fold_vha, select_ernie5_5_hca_cls
+from .flashindexer import (
+    FLASHINDEXER_WEIGHTS_SUBFOLDER,
+    assert_flashindexer_params_loaded,
+    attach_flashindexer_gate,
+)
 from .moe import Ernie5_5MLP, Ernie5_5MoE
 from .quant_config import (
     dequantize_block_fp8,
@@ -367,6 +373,13 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # FlashIndexer gates only the target's DSA indexers. The MTP and DSpark
+        # drafts build their own decoder layers, so they keep all heads: their
+        # layer ids sit past the main stack and the checkpoint has no gate for them.
+        if config.enable_flashindexer:
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                if isinstance(layer.attn, Ernie5_5DSAAttention):
+                    attach_flashindexer_gate(layer.attn.indexer)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -787,6 +800,15 @@ class Ernie5_5ForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        if config.enable_flashindexer:
+            # The gate tensors load from their own subfolder of the checkpoint.
+            self.secondary_weights = [
+                DefaultModelLoader.Source(
+                    model_or_path=vllm_config.model_config.model,
+                    revision=vllm_config.model_config.revision,
+                    subfolder=FLASHINDEXER_WEIGHTS_SUBFOLDER,
+                )
+            ]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -815,7 +837,13 @@ class Ernie5_5ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # Checked here: `AutoWeightsLoader` groups the stream by prefix, so the
+        # inner loader runs once per contiguous `model.*` run, not once in total.
+        assert_flashindexer_params_loaded(
+            (n for n, _ in self.named_parameters()), loaded
+        )
+        return loaded
 
     def process_weights_after_loading(self) -> None:
         fold_vha(self)

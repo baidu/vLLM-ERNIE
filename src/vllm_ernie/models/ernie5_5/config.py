@@ -35,6 +35,7 @@ class Ernie5_5Config(PretrainedConfig):
         index_n_heads: int = 64,
         index_head_dim: int = 128,
         index_topk: int = 2048,
+        enable_flashindexer: bool = False,
         max_position_embeddings: int = 200192,
         rope_theta: float = 2500000.0,
         compress_rope_theta: float = 160000.0,
@@ -88,6 +89,7 @@ class Ernie5_5Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.enable_flashindexer = enable_flashindexer
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
         self.compress_rope_theta = compress_rope_theta

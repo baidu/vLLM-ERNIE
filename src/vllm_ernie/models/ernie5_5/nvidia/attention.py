@@ -89,6 +89,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
+from .flashindexer import flashindexer_context
 from .quant_config import keeps_fp8_wo_a
 
 logger = init_logger(__name__)
@@ -876,6 +877,7 @@ class Ernie5_5Indexer(nn.Module):
         super().__init__()
         self.n_head = config.index_n_heads
         self.head_dim = config.index_head_dim
+        self.hidden_size = config.hidden_size
         self.rope_dim = config.mla_qk_rope_head_dim
         self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
         if self.use_fp4_kv:
@@ -951,6 +953,9 @@ class Ernie5_5Indexer(nn.Module):
             skip_k_cache_insert=self.use_fp4_kv,
             use_fp4_cache=self.use_fp4_kv,
         )
+        # Set by `attach_flashindexer_gate`, which the target model calls on its own
+        # DSA layers; a draft layer keeps the placeholder and scores all heads.
+        self.linear_gate = None
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions: torch.Tensor
@@ -979,9 +984,12 @@ class Ernie5_5Indexer(nn.Module):
             q = q.view(-1, self.n_head, self.head_dim)
             weights = weights * q_scale.view(-1, self.n_head) * self.weights_scale
             q_with_scale = (q, None)
-        return self.indexer_op(
-            hidden_states, q_with_scale, None if self.use_fp4_kv else k, weights
-        )
+        k_input = None if self.use_fp4_kv else k
+        if self.linear_gate is None:
+            return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
+        # The patched prefill logits kernel reads its gate input from here.
+        with flashindexer_context(self, hidden_states, weights):
+            return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
 
     def _quantize_fp4(
         self, q: torch.Tensor, k: torch.Tensor
