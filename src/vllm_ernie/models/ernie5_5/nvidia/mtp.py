@@ -28,7 +28,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .attention import fold_vha
+from .attention import fold_vha, setup_fused_topk
 from .model import (
     Ernie5_5DecoderLayer,
     Ernie5_5MixtureOfExperts,
@@ -38,7 +38,11 @@ from .model import (
     load_ernie5_5_weights,
     topk_buffers,
 )
-from .quant_config import fp8_block_size, use_ernie5_5_mxfp8
+from .quant_config import (
+    fp8_block_size,
+    use_ernie5_5_mxfp4_experts,
+    use_ernie5_5_mxfp8,
+)
 
 # Per-MTP-layer modules outside the decoder block.
 _MTP_LAYER_OWN = ("enorm.", "hnorm.", "e_proj.", "h_proj.", "shared_head.", "hc_head_")
@@ -207,6 +211,7 @@ class Ernie5_5MTP(nn.Module, Ernie5_5MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.mxfp8 = use_ernie5_5_mxfp8(vllm_config)
+        self.mxfp4_experts = use_ernie5_5_mxfp4_experts(vllm_config)
         self.fp8_block = fp8_block_size(vllm_config)
         self.model = Ernie5_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -279,3 +284,4 @@ class Ernie5_5MTP(nn.Module, Ernie5_5MixtureOfExperts):
 
     def process_weights_after_loading(self) -> None:
         fold_vha(self)
+        setup_fused_topk(self)

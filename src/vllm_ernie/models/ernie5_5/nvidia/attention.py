@@ -13,7 +13,12 @@ from torch import nn
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CacheConfig,
+    VllmConfig,
+    get_current_vllm_config,
+    get_layers_from_vllm_config,
+)
 from vllm.config.cache import CacheDType
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -89,7 +94,16 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 
-from .flashindexer import flashindexer_context
+from .flashindexer import FLASHINDEXER_TOPK_HEADS, flashindexer_context
+from .indexer_fused_topk import (
+    FusedTopkConfig,
+    PrefillChunkSlices,
+    build_fused_topk_config,
+    fused_topk_context,
+    select_split_config,
+    split_prefill_chunks,
+    warmup_fused_topk,
+)
 from .quant_config import keeps_fp8_wo_a
 
 logger = init_logger(__name__)
@@ -649,6 +663,22 @@ class Ernie5_5IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         super().__init__(*args, **kwargs)
         self.window = self.vllm_config.model_config.hf_config.sliding_window
         self.windowed_seq_lens_buffer = torch.zeros_like(self.decode_seq_lens_buffer)
+        # Built after weight loading, which settles each indexer's fused top-k.
+        indexer_cache_by_layer_name = get_layers_from_vllm_config(
+            self.vllm_config, Ernie5_5IndexerCache, self.layer_names
+        )
+        self.split_config = select_split_config(
+            [cache.fused_topk_config for cache in indexer_cache_by_layer_name.values()]
+        )
+
+    def _split_indexer_prefill_chunks(
+        self, *args, **kwargs
+    ) -> list[PrefillChunkSlices]:
+        # The fused top-k needs no logits matrix, so its requests stay whole.
+        vllm_split = super()._split_indexer_prefill_chunks
+        if self.split_config is None:
+            return vllm_split(*args, **kwargs)
+        return split_prefill_chunks(self.split_config, vllm_split, *args, **kwargs)
 
     def build(
         self,
@@ -822,6 +852,9 @@ class Ernie5_5IndexerBackend(DeepseekV32IndexerBackend):
 
 
 class Ernie5_5IndexerCache(DeepseekV32IndexerCache):
+    # Set by `Ernie5_5Indexer.setup_fused_topk`, read by the metadata builder.
+    fused_topk_config: FusedTopkConfig | None = None
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return _dsa_page_spec(super().get_kv_cache_spec(vllm_config), vllm_config)
 
@@ -957,6 +990,22 @@ class Ernie5_5Indexer(nn.Module):
         # DSA layers; a draft layer keeps the placeholder and scores all heads.
         self.linear_gate = None
 
+    def setup_fused_topk(self, vllm_config: VllmConfig) -> None:
+        """Serve large prefill chunks with HALOps fused MQA logits + top-k."""
+        # A FlashIndexer gate hands the logits kernel only the heads it selects.
+        num_heads = self.n_head if self.linear_gate is None else FLASHINDEXER_TOPK_HEADS
+        config = build_fused_topk_config(
+            vllm_config,
+            num_heads=num_heads,
+            head_dim=self.head_dim,
+            top_k=self.indexer_op.topk_tokens,
+            use_fp4_kv=self.use_fp4_kv,
+            kv_cache_prefix=self.k_cache.prefix,
+        )
+        self.k_cache.fused_topk_config = config
+        if config is not None:
+            warmup_fused_topk(config)
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
@@ -985,11 +1034,12 @@ class Ernie5_5Indexer(nn.Module):
             weights = weights * q_scale.view(-1, self.n_head) * self.weights_scale
             q_with_scale = (q, None)
         k_input = None if self.use_fp4_kv else k
-        if self.linear_gate is None:
-            return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
-        # The patched prefill logits kernel reads its gate input from here.
-        with flashindexer_context(self, hidden_states, weights):
-            return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
+        with fused_topk_context(self.k_cache.fused_topk_config):
+            if self.linear_gate is None:
+                return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
+            # The patched prefill logits kernel reads its gate input from here.
+            with flashindexer_context(self, hidden_states, weights):
+                return self.indexer_op(hidden_states, q_with_scale, k_input, weights)
 
     def _quantize_fp4(
         self, q: torch.Tensor, k: torch.Tensor
@@ -1031,6 +1081,14 @@ class Ernie5_5Indexer(nn.Module):
             q_values.view(-1, self.n_head, self.head_dim // 2),
             q_scales.view(torch.int32).view(-1, self.n_head),
         )
+
+
+def setup_fused_topk(model: nn.Module) -> None:
+    """Set up every indexer's fused top-k; call once its weights are loaded."""
+    vllm_config = get_current_vllm_config()
+    for module in model.modules():
+        if isinstance(module, Ernie5_5Indexer):
+            module.setup_fused_topk(vllm_config)
 
 
 class Ernie5_5MLAAttention(MLAAttention):

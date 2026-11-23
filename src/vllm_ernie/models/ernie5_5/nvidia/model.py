@@ -54,7 +54,12 @@ from vllm_ernie.models.ernie5_5.mhc import (
     mhc_pre_tilelang,
 )
 
-from .attention import Ernie5_5DSAAttention, fold_vha, select_ernie5_5_hca_cls
+from .attention import (
+    Ernie5_5DSAAttention,
+    fold_vha,
+    select_ernie5_5_hca_cls,
+    setup_fused_topk,
+)
 from .flashindexer import (
     FLASHINDEXER_WEIGHTS_SUBFOLDER,
     assert_flashindexer_params_loaded,
@@ -848,6 +853,7 @@ class Ernie5_5ForCausalLM(
     def process_weights_after_loading(self) -> None:
         fold_vha(self)
         self.model.finalize_mhc_broadcast_weights()
+        setup_fused_topk(self)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
